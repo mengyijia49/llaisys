@@ -209,6 +209,7 @@ tensor_t Tensor::view(const std::vector<size_t> &shape) const {
 
 tensor_t Tensor::slice(size_t dim, size_t start, size_t end) const {
     // 新的偏移量计算：原偏移 + 开始位置 * 步长 * 单个元素字节数
+    //
     size_t new_offset = _offset + start * _meta.strides[dim] * elementSize();
     std::vector<size_t> new_shape = _meta.shape;
     new_shape[dim] = end - start;
