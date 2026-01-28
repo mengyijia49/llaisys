@@ -1,6 +1,7 @@
 #include "llaisys/models/qwen2.h"
 #include "llaisys/tensor.h"
 #include "llaisys_tensor.hpp"
+#include <cmath>
 #include <cstring>
 #include <string>
 #include <unordered_map>
