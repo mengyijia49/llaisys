@@ -5,10 +5,13 @@ from ..libllaisys.qwen2 import LlaisysQwen2Meta
 from pathlib import Path
 
 import safetensors
-import numpy as np
 
 try:
     import torch
+except Exception:
+    torch = None
+
+try:
     from transformers import AutoModelForCausalLM
     HF_AVAILABLE = True
 except Exception:
@@ -19,6 +22,13 @@ class Qwen2:
     def __init__(self, model_path, device: DeviceType = DeviceType.CPU):
         model_path = Path(model_path)
         self._backend_model = None
+        self._backend_kv = None
+        self._device = DeviceType.CPU if device == DeviceType.CPU else DeviceType.NVIDIA
+        self._device_id = 0
+        self._weight_tensors = []
+        self._maxseq = 2048
+        self._end_token = -1
+        self._dtype = DataType.F32
 
         # attempt to create backend model
         try:
@@ -32,7 +42,14 @@ class Qwen2:
                     cfg = json.load(f)
 
             meta = LlaisysQwen2Meta()
-            meta.dtype = DataType.BF16
+            dtype_str = str(cfg.get("torch_dtype", "bfloat16")).lower()
+            if "bfloat16" in dtype_str:
+                self._dtype = DataType.BF16
+            elif "float16" in dtype_str or "half" in dtype_str:
+                self._dtype = DataType.F16
+            else:
+                self._dtype = DataType.F32
+            meta.dtype = self._dtype
             # robustly extract fields from config
             meta.nlayer = int(cfg.get("num_hidden_layers", cfg.get("n_layer", cfg.get("num_layers", 0))))
             meta.hs = int(cfg.get("hidden_size", cfg.get("d_model", 0)))
@@ -47,41 +64,62 @@ class Qwen2:
             meta.epsilon = float(cfg.get("layer_norm_eps", cfg.get("eps", 1e-5)))
             meta.theta = float(cfg.get("rope_theta", cfg.get("theta", 10000.0)))
             meta.end_token = int(cfg.get("eos_token_id", cfg.get("end_token", -1)))
+            self._maxseq = int(meta.maxseq)
+            self._end_token = int(meta.end_token)
 
-            dev = DeviceType.CPU if device == DeviceType.CPU else DeviceType.NVIDIA
             import ctypes
 
-            self._backend_model = LIB_LLAISYS.llaisysQwen2ModelCreate(ctypes.byref(meta), dev, None, 0)
+            self._backend_model = LIB_LLAISYS.llaisysQwen2ModelCreate(ctypes.byref(meta), self._device, None, 0)
+
+            if torch is None:
+                raise RuntimeError("PyTorch is required to load safetensors weights")
+
+            if self._dtype == DataType.BF16:
+                target_torch_dtype = torch.bfloat16
+            elif self._dtype == DataType.F16:
+                target_torch_dtype = torch.float16
+            else:
+                target_torch_dtype = torch.float32
 
             for file in sorted(model_path.glob("*.safetensors")):
-                data_ = safetensors.safe_open(file, framework="numpy", device="cpu")
+                data_ = safetensors.safe_open(file, framework="pt", device="cpu")
                 for name_ in data_.keys():
-                    arr = data_.get_tensor(name_)
-                    if not arr.flags["C_CONTIGUOUS"]:
-                        arr = np.ascontiguousarray(arr)
-                    if arr.dtype != np.float32:
-                        arr = arr.astype(np.float32)
+                    ten = data_.get_tensor(name_).detach().cpu().contiguous()
+                    if ten.dtype != target_torch_dtype:
+                        ten = ten.to(target_torch_dtype)
 
-                    t = Tensor(shape=arr.shape, dtype=DataType.F32, device=DeviceType.CPU)
-                    t.load(arr.ctypes.data)
+                    t = Tensor(shape=ten.shape, dtype=self._dtype, device=self._device, device_id=self._device_id)
+                    t.load(ten.data_ptr())
                     LIB_LLAISYS.llaisysQwen2ModelSetWeight(self._backend_model, name_.encode("utf-8"), t.lib_tensor())
+                    self._weight_tensors.append(t)
 
             LIB_LLAISYS.llaisysQwen2ModelFinalize(self._backend_model)
+            self._backend_kv = LIB_LLAISYS.llaisysQwen2KVCreat(self._backend_model, self._maxseq)
 
             # verify some required weights exist (best-effort)
-            required = [b"model.norm.weight", b"embed_tokens.weight", b"lm_head.weight"]
+            required_groups = [
+                [b"model.norm.weight", b"norm.weight"],
+                [b"model.embed_tokens.weight", b"embed_tokens.weight"],
+                [b"lm_head.weight"],
+            ]
             missing = []
-            for r in required:
-                try:
-                    has = LIB_LLAISYS.llaisysQwen2ModelHasWeight(self._backend_model, r)
-                except Exception:
-                    has = 0
-                if not has:
-                    missing.append(r.decode("utf-8"))
+            for group in required_groups:
+                found = False
+                for r in group:
+                    try:
+                        has = LIB_LLAISYS.llaisysQwen2ModelHasWeight(self._backend_model, r)
+                    except Exception:
+                        has = 0
+                    if has:
+                        found = True
+                        break
+                if not found:
+                    missing.append(group[0].decode("utf-8"))
             if missing:
                 print("[llaisys qwen2] Warning: missing weights:", missing)
         except Exception as e:
             # backend unavailable or error during loading; fall back to HF
+            print(f"[llaisys qwen2] backend load failed: {e}")
             self._backend_model = None
 
         if self._backend_model is None:
@@ -103,9 +141,40 @@ class Qwen2:
             import ctypes
             from ctypes import c_int64, c_size_t
 
-            arr = (c_int64 * len(inputs))(*inputs)
-            out = LIB_LLAISYS.llaisysQwen2ModelInfer(self._backend_model, arr, c_size_t(len(inputs)))
-            return [int(out)]
+            input_ids = [int(t) for t in inputs]
+            if not input_ids:
+                return []
+
+            if max_new_tokens is None:
+                max_new_tokens = 128
+            max_new_tokens = int(max_new_tokens)
+            if max_new_tokens <= 0:
+                return input_ids
+
+            kv_cap = len(input_ids) + max_new_tokens
+            if self._maxseq > 0:
+                kv_cap = min(kv_cap, self._maxseq)
+            kv_cap = max(kv_cap, 1)
+
+            if self._backend_kv is not None:
+                LIB_LLAISYS.llaisysQwen2KVDestroy(self._backend_kv)
+                self._backend_kv = None
+            self._backend_kv = LIB_LLAISYS.llaisysQwen2KVCreat(self._backend_model, c_size_t(kv_cap))
+
+            arr = (c_int64 * len(input_ids))(*input_ids)
+            next_token = int(LIB_LLAISYS.llaisysQwen2ModelInfer(self._backend_model, arr, c_size_t(len(input_ids))))
+
+            output_ids = list(input_ids)
+            for _ in range(max_new_tokens):
+                if next_token is None:
+                    break
+                output_ids.append(next_token)
+                if self._end_token >= 0 and next_token == self._end_token:
+                    break
+                arr = (c_int64 * 1)(next_token)
+                next_token = int(LIB_LLAISYS.llaisysQwen2ModelInfer(self._backend_model, arr, c_size_t(1)))
+
+            return output_ids
 
         input_ids = torch.tensor([list(inputs)], dtype=torch.long, device=self.device)
         with torch.no_grad():
@@ -119,6 +188,12 @@ class Qwen2:
         return outputs[0].tolist()
 
     def __del__(self):
+        try:
+            if self._backend_kv is not None:
+                LIB_LLAISYS.llaisysQwen2KVDestroy(self._backend_kv)
+                self._backend_kv = None
+        except Exception:
+            pass
         try:
             if self._backend_model is not None:
                 LIB_LLAISYS.llaisysQwen2ModelDestroy(self._backend_model)

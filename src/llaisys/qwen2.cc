@@ -9,9 +9,12 @@
 #include <vector>
 #include <iostream>
 #include "llaisys/ops.h"
+#include "../core/llaisys_core.hpp"
 
 struct LlaisysQwen2Model {
     LlaisysQwen2Meta meta;
+    llaisysDeviceType_t device_type = LLAISYS_DEVICE_CPU;
+    int device_id = 0;
     LlaisysQwen2Weights weights;
     // store arbitrary named tensors provided from python
     std::unordered_map<std::string, llaisysTensor_t> weight_map;
@@ -26,12 +29,18 @@ __export struct LlaisysQwen2Model *llaisysQwen2ModelCreate(const LlaisysQwen2Met
     if (!meta) return nullptr;
     LlaisysQwen2Model *m = new LlaisysQwen2Model();
     m->meta = *meta;
+    m->device_type = device;
+    m->device_id = (device_ids != nullptr && ndevice > 0) ? device_ids[0] : 0;
     memset(&m->weights, 0, sizeof(m->weights));
     return m;
 }
 
 __export void llaisysQwen2ModelDestroy(struct LlaisysQwen2Model * model) {
     if (!model) return;
+    if (model->kv_cache) {
+        llaisysQwen2KVDestroy((void *)model->kv_cache);
+        model->kv_cache = nullptr;
+    }
     model->weight_map.clear();
     if (model->weights.attn_norm_w) delete[] model->weights.attn_norm_w;
     if (model->weights.attn_q_w) delete[] model->weights.attn_q_w;
@@ -71,8 +80,29 @@ static bool tensor_matches_shape_and_dtype(llaisysTensor_t t, const std::vector<
     }
 }
 
+static void ensure_layer_weight_arrays(LlaisysQwen2Model *model) {
+    if (!model || model->meta.nlayer == 0) {
+        return;
+    }
+
+    size_t n = model->meta.nlayer;
+    if (!model->weights.attn_norm_w) model->weights.attn_norm_w = new llaisysTensor_t[n]();
+    if (!model->weights.attn_q_w) model->weights.attn_q_w = new llaisysTensor_t[n]();
+    if (!model->weights.attn_q_b) model->weights.attn_q_b = new llaisysTensor_t[n]();
+    if (!model->weights.attn_k_w) model->weights.attn_k_w = new llaisysTensor_t[n]();
+    if (!model->weights.attn_k_b) model->weights.attn_k_b = new llaisysTensor_t[n]();
+    if (!model->weights.attn_v_w) model->weights.attn_v_w = new llaisysTensor_t[n]();
+    if (!model->weights.attn_v_b) model->weights.attn_v_b = new llaisysTensor_t[n]();
+    if (!model->weights.attn_o_w) model->weights.attn_o_w = new llaisysTensor_t[n]();
+    if (!model->weights.mlp_norm_w) model->weights.mlp_norm_w = new llaisysTensor_t[n]();
+    if (!model->weights.mlp_gate_w) model->weights.mlp_gate_w = new llaisysTensor_t[n]();
+    if (!model->weights.mlp_up_w) model->weights.mlp_up_w = new llaisysTensor_t[n]();
+    if (!model->weights.mlp_down_w) model->weights.mlp_down_w = new llaisysTensor_t[n]();
+}
+
 __export int llaisysQwen2ModelSetWeight(struct LlaisysQwen2Model * model, const char * name, llaisysTensor_t tensor) {
     if (!model || !name) return -1;
+    ensure_layer_weight_arrays(model);
     std::string sname(name);
     model->weight_map[sname] = tensor;
 
@@ -89,7 +119,7 @@ __export int llaisysQwen2ModelSetWeight(struct LlaisysQwen2Model * model, const 
         else std::cerr << "[llaisys qwen2] Warning: out_embed shape/dtype mismatch for " << sname << std::endl;
         return 0;
     }
-    if (str_contains_any(sname, {"model.norm.weight", "ln_f.weight", "final_layernorm.weight", "out_norm.weight", "norm.weight"})) {
+    if (sname == "norm.weight" || str_contains_any(sname, {"model.norm.weight", "ln_f.weight", "final_layernorm.weight", "out_norm.weight"})) {
         // avoid matching layer-norm inside layers by checking common patterns
         std::vector<size_t> exp = {model->meta.hs};
         if (tensor_matches_shape_and_dtype(tensor, exp, model->meta.dtype)) model->weights.out_norm_w = tensor;
@@ -116,8 +146,17 @@ __export int llaisysQwen2ModelSetWeight(struct LlaisysQwen2Model * model, const 
         size_t dh = model->meta.dh;
         size_t di = model->meta.di;
 
+        // post-attention norm
+        if (str_contains_any(sname, {"post_attention_layernorm.weight", "ln_2.weight", "layernorm_after.weight"})) {
+            std::vector<size_t> exp = {hs};
+            if (tensor_matches_shape_and_dtype(tensor, exp, model->meta.dtype)) model->weights.mlp_norm_w[idx] = tensor;
+            else std::cerr << "[llaisys qwen2] Warning: mlp_norm_w["<<idx<<"] shape/dtype mismatch" << std::endl;
+            return 0;
+        }
+
         // input layer norm weight [hs]
-        if (str_contains_any(sname, {"input_layernorm.weight", "ln_1.weight", "layernorm_before.weight", "attention_layernorm.weight"})) {
+        if (str_contains_any(sname, {"input_layernorm.weight", "ln_1.weight", "layernorm_before.weight"}) ||
+            (sname.find("attention_layernorm.weight") != std::string::npos && sname.find("post_attention_layernorm.weight") == std::string::npos)) {
             std::vector<size_t> exp = {hs};
             if (tensor_matches_shape_and_dtype(tensor, exp, model->meta.dtype)) model->weights.attn_norm_w[idx] = tensor;
             else std::cerr << "[llaisys qwen2] Warning: attn_norm_w["<<idx<<"] shape/dtype mismatch" << std::endl;
@@ -171,14 +210,6 @@ __export int llaisysQwen2ModelSetWeight(struct LlaisysQwen2Model * model, const 
             std::vector<size_t> exp = {hs, nh * dh};
             if (tensor_matches_shape_and_dtype(tensor, exp, model->meta.dtype)) model->weights.attn_o_w[idx] = tensor;
             else std::cerr << "[llaisys qwen2] Warning: attn_o_w["<<idx<<"] shape/dtype mismatch" << std::endl;
-            return 0;
-        }
-
-        // post-attention norm
-        if (str_contains_any(sname, {"post_attention_layernorm.weight", "ln_2.weight", "layernorm_after.weight"})) {
-            std::vector<size_t> exp = {hs};
-            if (tensor_matches_shape_and_dtype(tensor, exp, model->meta.dtype)) model->weights.mlp_norm_w[idx] = tensor;
-            else std::cerr << "[llaisys qwen2] Warning: mlp_norm_w["<<idx<<"] shape/dtype mismatch" << std::endl;
             return 0;
         }
 
@@ -265,41 +296,91 @@ __export int llaisysQwen2ModelFinalize(struct LlaisysQwen2Model * model) {
 
 // Simple KV cache structure and APIs
 struct KVCache {
-    size_t max_tokens;
-    std::vector<llaisysTensor_t> keys;
-    std::vector<llaisysTensor_t> vals;
+    LlaisysQwen2Model *owner = nullptr;
+    size_t max_tokens = 0;
+    size_t nlayer = 0;
+    std::vector<std::vector<llaisysTensor_t>> keys;
+    std::vector<std::vector<llaisysTensor_t>> vals;
 };
 
+static llaisysTensor_t make_tensor(const std::vector<size_t> &shape, llaisysDataType_t dtype, llaisysDeviceType_t device, int device_id) {
+    return new LlaisysTensor{llaisys::Tensor::create(shape, dtype, device, device_id)};
+}
+
+static void clear_layer_cache(std::vector<llaisysTensor_t> &cache) {
+    for (auto *t : cache) {
+        delete t;
+    }
+    cache.clear();
+}
+
+static void kv_append_for_layer(KVCache *kv, size_t layer_idx, llaisysTensor_t k, llaisysTensor_t v) {
+    if (!kv || layer_idx >= kv->nlayer || !k || !v) {
+        return;
+    }
+    auto &ks = kv->keys[layer_idx];
+    auto &vs = kv->vals[layer_idx];
+
+    if (kv->max_tokens > 0 && ks.size() >= kv->max_tokens) {
+        delete ks.front();
+        ks.erase(ks.begin());
+        delete vs.front();
+        vs.erase(vs.begin());
+    }
+
+    ks.push_back(k);
+    vs.push_back(v);
+}
+
 __export void *llaisysQwen2KVCreat(struct LlaisysQwen2Model * model, size_t max_tokens) {
+    if (!model) return nullptr;
+
+    if (model->kv_cache) {
+        llaisysQwen2KVDestroy((void *)model->kv_cache);
+    }
+
     KVCache *kv = new KVCache();
+    kv->owner = model;
     kv->max_tokens = max_tokens;
-    kv->keys.reserve(max_tokens);
-    kv->vals.reserve(max_tokens);
-    if (model) model->kv_cache = kv;
+    kv->nlayer = model->meta.nlayer;
+    kv->keys.resize(kv->nlayer);
+    kv->vals.resize(kv->nlayer);
+    for (size_t i = 0; i < kv->nlayer; ++i) {
+        kv->keys[i].reserve(max_tokens);
+        kv->vals[i].reserve(max_tokens);
+    }
+    model->kv_cache = kv;
     return (void *)kv;
 }
 
 __export void llaisysQwen2KVDestroy(void *kv) {
     if (!kv) return;
     KVCache *c = (KVCache *)kv;
+    for (size_t i = 0; i < c->nlayer; ++i) {
+        clear_layer_cache(c->keys[i]);
+        clear_layer_cache(c->vals[i]);
+    }
     c->keys.clear();
     c->vals.clear();
+    if (c->owner && c->owner->kv_cache == c) {
+        c->owner->kv_cache = nullptr;
+    }
     delete c;
 }
 
 __export int llaisysQwen2KVAppend(void *kv, llaisysTensor_t k, llaisysTensor_t v) {
     if (!kv) return -1;
     KVCache *c = (KVCache *)kv;
-    if (c->keys.size() >= c->max_tokens) return -1;
-    c->keys.push_back(k);
-    c->vals.push_back(v);
+    if (c->nlayer == 0) return -1;
+    kv_append_for_layer(c, 0, k, v);
     return 0;
 }
 
 __export size_t llaisysQwen2KVLen(void *kv) {
     if (!kv) return 0;
     KVCache *c = (KVCache *)kv;
-    return c->keys.size();
+    if (c->nlayer == 0) return 0;
+    return c->keys[0].size();
 }
 
 __export uint8_t llaisysQwen2ModelHasWeight(struct LlaisysQwen2Model * model, const char * name) {
@@ -309,248 +390,203 @@ __export uint8_t llaisysQwen2ModelHasWeight(struct LlaisysQwen2Model * model, co
     return it != model->weight_map.end() ? 1 : 0;
 }
 
-__export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken) {
-    // More complete per-layer feedforward inference (attention skipped):
-    if (!model) return -1;
-    std::cerr << "[llaisys qwen2] infer entry" << std::endl;
-    if (ntoken == 0 || token_ids == nullptr) return model->meta.end_token;
-
-    int64_t last = token_ids[ntoken - 1];
-
-    // require embedding and out projection
-    if (!model->weights.in_embed || !model->weights.out_embed) {
-        return last;
-    }
-
+static int64_t infer_one_token(struct LlaisysQwen2Model *model, int64_t token_id) {
     using namespace llaisys;
 
-    // create index tensor [1]
-    std::vector<size_t> idx_shape = {1};
-    auto idx_tensor = Tensor::create(idx_shape, LLAISYS_DTYPE_I64, LLAISYS_DEVICE_CPU, 0);
-    LlaisysTensor *idx = new LlaisysTensor{idx_tensor};
-    idx->tensor->load(&last);
+    if (!model->weights.in_embed || !model->weights.out_embed) {
+        return token_id;
+    }
 
-    // embedding -> x [1, hs]
-    std::vector<size_t> emb_shape = {1, model->meta.hs};
-    auto x_tensor = Tensor::create(emb_shape, LLAISYS_DTYPE_F32, LLAISYS_DEVICE_CPU, 0);
-    LlaisysTensor *x = new LlaisysTensor{x_tensor};
+    llaisys::core::context().setDevice(model->device_type, model->device_id);
+    const LlaisysRuntimeAPI *runtime_api = llaisys::core::context().runtime().api();
+
+    const llaisysDataType_t dtype = model->meta.dtype;
+    const size_t hs = model->meta.hs;
+    const size_t nh = model->meta.nh;
+    const size_t nkvh = model->meta.nkvh;
+    const size_t dh = model->meta.dh;
+    const size_t di = model->meta.di;
+    const std::vector<size_t> one_shape = {1};
+    const std::vector<size_t> hidden_shape = {1, hs};
+    const std::vector<size_t> q_shape = {1, nh, dh};
+    const std::vector<size_t> kv_shape = {1, nkvh, dh};
+
+    auto idx = make_tensor(one_shape, LLAISYS_DTYPE_I64, model->device_type, model->device_id);
+    idx->tensor->load(&token_id);
+
+    auto x = make_tensor(hidden_shape, dtype, model->device_type, model->device_id);
     llaisysEmbedding(x, idx, model->weights.in_embed);
-    std::cerr << "[llaisys qwen2] after embedding" << std::endl;
 
-    // per-layer processing
-    size_t n = model->meta.nlayer;
-    for (size_t i = 0; i < n; ++i) {
-        std::cerr << "[llaisys qwen2] layer " << i << " start" << std::endl;
-        // optional rms_norm -> normed [1, hs]
-        LlaisysTensor *norm = nullptr;
-        if (model->weights.attn_norm_w && model->weights.attn_norm_w[i]) {
-            auto norm_tensor = Tensor::create(emb_shape, LLAISYS_DTYPE_F32, LLAISYS_DEVICE_CPU, 0);
-            norm = new LlaisysTensor{norm_tensor};
-            llaisysRmsNorm(norm, x, model->weights.attn_norm_w[i], model->meta.epsilon);
-        }
+    KVCache *kv = model->kv_cache;
 
-        // Attention: compute q,k,v, append to KV and run self-attention
-        bool has_attn = model->weights.attn_norm_w && model->weights.attn_q_w && model->weights.attn_k_w && model->weights.attn_v_w && model->weights.attn_o_w &&
-                        model->weights.attn_norm_w[i] && model->weights.attn_q_w[i] && model->weights.attn_k_w[i] && model->weights.attn_v_w[i] && model->weights.attn_o_w[i];
+    for (size_t i = 0; i < model->meta.nlayer; ++i) {
+        bool has_attn = model->weights.attn_norm_w && model->weights.attn_q_w && model->weights.attn_k_w && model->weights.attn_v_w &&
+                        model->weights.attn_o_w && model->weights.attn_norm_w[i] && model->weights.attn_q_w[i] &&
+                        model->weights.attn_k_w[i] && model->weights.attn_v_w[i] && model->weights.attn_o_w[i];
 
         if (has_attn) {
-            // q: project norm -> [1, nh*dh] then view [1, nh, dh]
-            size_t nh = model->meta.nh;
-            size_t dh = model->meta.dh;
-            size_t nkv = model->meta.nkvh;
+            auto norm1 = make_tensor(hidden_shape, dtype, model->device_type, model->device_id);
+            llaisysRmsNorm(norm1, x, model->weights.attn_norm_w[i], model->meta.epsilon);
 
-            std::vector<size_t> qflat_shape = {1, nh * dh};
-            auto qflat_tensor = Tensor::create(qflat_shape, LLAISYS_DTYPE_F32, LLAISYS_DEVICE_CPU, 0);
-            LlaisysTensor *qflat = new LlaisysTensor{qflat_tensor};
-            llaisysLinear(qflat, norm ? norm : x, model->weights.attn_q_w[i], model->weights.attn_q_b && model->weights.attn_q_b[i] ? model->weights.attn_q_b[i] : nullptr);
-            // view to [1, nh, dh]
-            LlaisysTensor *q = nullptr;
-            try {
-                auto q_view = qflat->tensor->view({1, nh, dh});
-                q = new LlaisysTensor{q_view};
-            } catch (...) {
-                delete qflat; qflat = nullptr;
+            auto qflat = make_tensor({1, nh * dh}, dtype, model->device_type, model->device_id);
+            auto kflat = make_tensor({1, nkvh * dh}, dtype, model->device_type, model->device_id);
+            auto vflat = make_tensor({1, nkvh * dh}, dtype, model->device_type, model->device_id);
+
+            llaisysLinear(qflat, norm1, model->weights.attn_q_w[i], model->weights.attn_q_b ? model->weights.attn_q_b[i] : nullptr);
+            llaisysLinear(kflat, norm1, model->weights.attn_k_w[i], model->weights.attn_k_b ? model->weights.attn_k_b[i] : nullptr);
+            llaisysLinear(vflat, norm1, model->weights.attn_v_w[i], model->weights.attn_v_b ? model->weights.attn_v_b[i] : nullptr);
+
+            auto q = new LlaisysTensor{qflat->tensor->view(q_shape)};
+            auto k = new LlaisysTensor{kflat->tensor->view(kv_shape)};
+            auto v = new LlaisysTensor{vflat->tensor->view(kv_shape)};
+
+            int64_t pos = 0;
+            if (kv && i < kv->nlayer) {
+                pos = static_cast<int64_t>(kv->keys[i].size());
             }
 
-            // k: project norm -> [1, nkv*dh] then view [1, nkv, dh]
-            std::vector<size_t> kflat_shape = {1, nkv * dh};
-            auto kflat_tensor = Tensor::create(kflat_shape, LLAISYS_DTYPE_F32, LLAISYS_DEVICE_CPU, 0);
-            LlaisysTensor *kflat = new LlaisysTensor{kflat_tensor};
-            llaisysLinear(kflat, norm ? norm : x, model->weights.attn_k_w[i], model->weights.attn_k_b && model->weights.attn_k_b[i] ? model->weights.attn_k_b[i] : nullptr);
-            LlaisysTensor *k = nullptr;
-            try {
-                auto k_view = kflat->tensor->view({1, nkv, dh});
-                k = new LlaisysTensor{k_view};
-            } catch (...) {
-                delete kflat; kflat = nullptr;
+            auto pos_ids = make_tensor(one_shape, LLAISYS_DTYPE_I64, model->device_type, model->device_id);
+            pos_ids->tensor->load(&pos);
+
+            auto q_rope = make_tensor(q_shape, dtype, model->device_type, model->device_id);
+            auto k_rope = make_tensor(kv_shape, dtype, model->device_type, model->device_id);
+            llaisysROPE(q_rope, q, pos_ids, model->meta.theta);
+            llaisysROPE(k_rope, k, pos_ids, model->meta.theta);
+
+            bool saved_in_cache = false;
+            if (kv && i < kv->nlayer) {
+                kv_append_for_layer(kv, i, k_rope, v);
+                saved_in_cache = true;
             }
 
-            // v: project norm -> [1, nkv*dh] then view [1, nkv, dh]
-            std::vector<size_t> vflat_shape = {1, nkv * dh};
-            auto vflat_tensor = Tensor::create(vflat_shape, LLAISYS_DTYPE_F32, LLAISYS_DEVICE_CPU, 0);
-            LlaisysTensor *vflat = new LlaisysTensor{vflat_tensor};
-            llaisysLinear(vflat, norm ? norm : x, model->weights.attn_v_w[i], model->weights.attn_v_b && model->weights.attn_v_b[i] ? model->weights.attn_v_b[i] : nullptr);
-            LlaisysTensor *v = nullptr;
-            try {
-                auto v_view = vflat->tensor->view({1, nkv, dh});
-                v = new LlaisysTensor{v_view};
-            } catch (...) {
-                delete vflat; vflat = nullptr;
-            }
-
-            // append k/v to kv cache if exists (or create ephemeral vectors)
-            KVCache *kv = model->kv_cache;
-            if (kv) {
-                // note: KVAppend stores handles, we transfer ownership semantics to KVCache (do not delete appended tensors here)
-                llaisysQwen2KVAppend(kv, k, v);
-            }
-
-            // build k_all and v_all from KV entries
-            size_t total_len = 1;
-            std::vector<LlaisysTensor *> kv_keys;
-            std::vector<LlaisysTensor *> kv_vals;
-            if (kv && !kv->keys.empty()) {
-                total_len = kv->keys.size();
-                kv_keys = kv->keys;
-                kv_vals = kv->vals;
+            std::vector<llaisysTensor_t> local_keys;
+            std::vector<llaisysTensor_t> local_vals;
+            const std::vector<llaisysTensor_t> *k_src = nullptr;
+            const std::vector<llaisysTensor_t> *v_src = nullptr;
+            if (saved_in_cache) {
+                k_src = &kv->keys[i];
+                v_src = &kv->vals[i];
             } else {
-                total_len = 1;
-                kv_keys = {k};
-                kv_vals = {v};
+                local_keys.push_back(k_rope);
+                local_vals.push_back(v);
+                k_src = &local_keys;
+                v_src = &local_vals;
             }
 
-            // create k_all [total_len, nkv, dh], v_all [total_len, nkv, dh]
-            std::vector<size_t> k_all_shape = {total_len, nkv, dh};
-            auto k_all_t = Tensor::create(k_all_shape, LLAISYS_DTYPE_F32, LLAISYS_DEVICE_CPU, 0);
-            auto v_all_t = Tensor::create(k_all_shape, LLAISYS_DTYPE_F32, LLAISYS_DEVICE_CPU, 0);
-            LlaisysTensor *k_all = new LlaisysTensor{k_all_t};
-            LlaisysTensor *v_all = new LlaisysTensor{v_all_t};
-
-            // copy each stored key/val into k_all/v_all
+            const size_t total_len = k_src->size();
+            auto k_all = make_tensor({total_len, nkvh, dh}, dtype, model->device_type, model->device_id);
+            auto v_all = make_tensor({total_len, nkvh, dh}, dtype, model->device_type, model->device_id);
+            const size_t bytes_per_token = nkvh * dh * k_all->tensor->elementSize();
             for (size_t j = 0; j < total_len; ++j) {
-                // compute byte size per entry
-                size_t elems = nkv * dh;
-                size_t bytes = elems * model->weights.in_embed->tensor->elementSize();
-                // source pointers
-                const std::byte *src_k = kv_keys[j]->tensor->data();
-                const std::byte *src_v = kv_vals[j]->tensor->data();
-                std::byte *dst_k = k_all->tensor->data() + j * elems * model->weights.in_embed->tensor->elementSize();
-                std::byte *dst_v = v_all->tensor->data() + j * elems * model->weights.in_embed->tensor->elementSize();
-                // memcpy (works for CPU)
-                std::memcpy(dst_k, src_k, bytes);
-                std::memcpy(dst_v, src_v, bytes);
+                runtime_api->memcpy_sync(k_all->tensor->data() + j * bytes_per_token, (*k_src)[j]->tensor->data(), bytes_per_token, LLAISYS_MEMCPY_D2D);
+                runtime_api->memcpy_sync(v_all->tensor->data() + j * bytes_per_token, (*v_src)[j]->tensor->data(), bytes_per_token, LLAISYS_MEMCPY_D2D);
             }
 
-            // prepare attn_out [1, nh, dh]
-            std::vector<size_t> attn_shape = {1, nh, dh};
-            auto attn_t = Tensor::create(attn_shape, LLAISYS_DTYPE_F32, LLAISYS_DEVICE_CPU, 0);
-            LlaisysTensor *attn_out = new LlaisysTensor{attn_t};
+            auto attn_val = make_tensor(q_shape, dtype, model->device_type, model->device_id);
+            const float scale = 1.0f / std::sqrt(static_cast<float>(dh));
+            llaisysSelfAttention(attn_val, q_rope, k_all, v_all, scale);
 
-            float scale = 1.0f / std::sqrt((float)dh);
-            llaisysSelfAttention(attn_out, q, k_all, v_all, scale);
+            auto attn_flat = new LlaisysTensor{attn_val->tensor->view(hidden_shape)};
+            auto attn_out = make_tensor(hidden_shape, dtype, model->device_type, model->device_id);
+            llaisysLinear(attn_out, attn_flat, model->weights.attn_o_w[i], nullptr);
 
-            // flatten attn_out to [1, hs] and add to x
-            try {
-                auto attn_flat = attn_out->tensor->view({1, model->meta.hs});
-                LlaisysTensor *attn_flat_t = new LlaisysTensor{attn_flat};
-                auto new_x_tensor = Tensor::create(emb_shape, LLAISYS_DTYPE_F32, LLAISYS_DEVICE_CPU, 0);
-                LlaisysTensor *new_x = new LlaisysTensor{new_x_tensor};
-                llaisysAdd(new_x, x, attn_flat_t);
-                delete x; x = new_x;
-                delete attn_flat_t;
-            } catch (...) {
-                // ignore
+            auto x_next = make_tensor(hidden_shape, dtype, model->device_type, model->device_id);
+            llaisysAdd(x_next, x, attn_out);
+            delete x;
+            x = x_next;
+
+            delete norm1;
+            delete qflat;
+            delete kflat;
+            delete vflat;
+            delete q;
+            delete k;
+            delete pos_ids;
+            delete q_rope;
+            delete k_all;
+            delete v_all;
+            delete attn_val;
+            delete attn_flat;
+            delete attn_out;
+
+            if (!saved_in_cache) {
+                delete k_rope;
+                delete v;
             }
-
-            // cleanup temporaries we own (do not delete kv-stored tensors)
-            delete qflat; if (q) delete q;
-            if (!kv) { delete kflat; if (k) delete k; delete vflat; if (v) delete v; }
-            delete k_all; delete v_all; delete attn_out;
         }
 
-        // MLP: only run if the expected mlp weights are present
         bool has_mlp = model->weights.mlp_norm_w && model->weights.mlp_gate_w && model->weights.mlp_up_w && model->weights.mlp_down_w &&
-                       model->weights.mlp_norm_w[i] && model->weights.mlp_gate_w[i] && model->weights.mlp_up_w[i] && model->weights.mlp_down_w[i];
+                       model->weights.mlp_norm_w[i] && model->weights.mlp_gate_w[i] && model->weights.mlp_up_w[i] &&
+                       model->weights.mlp_down_w[i];
 
         if (has_mlp) {
-            std::cerr << "[llaisys qwen2] layer " << i << " mlp present" << std::endl;
-            auto mlp_in = Tensor::create(emb_shape, LLAISYS_DTYPE_F32, LLAISYS_DEVICE_CPU, 0);
-            LlaisysTensor *mlp_in_t = new LlaisysTensor{mlp_in};
-            llaisysRmsNorm(mlp_in_t, x, model->weights.mlp_norm_w[i], model->meta.epsilon);
+            auto norm2 = make_tensor(hidden_shape, dtype, model->device_type, model->device_id);
+            llaisysRmsNorm(norm2, x, model->weights.mlp_norm_w[i], model->meta.epsilon);
 
-            // gate [1, di]
-            std::vector<size_t> gate_shape = {1, model->meta.di};
-            auto gate_tensor = Tensor::create(gate_shape, LLAISYS_DTYPE_F32, LLAISYS_DEVICE_CPU, 0);
-            LlaisysTensor *gate = new LlaisysTensor{gate_tensor};
-            // up [1, di]
-            auto up_tensor = Tensor::create(gate_shape, LLAISYS_DTYPE_F32, LLAISYS_DEVICE_CPU, 0);
-            LlaisysTensor *up = new LlaisysTensor{up_tensor};
+            auto gate = make_tensor({1, di}, dtype, model->device_type, model->device_id);
+            auto up = make_tensor({1, di}, dtype, model->device_type, model->device_id);
+            auto act = make_tensor({1, di}, dtype, model->device_type, model->device_id);
+            auto down = make_tensor(hidden_shape, dtype, model->device_type, model->device_id);
 
-            // linear projections
-            llaisysLinear(gate, mlp_in_t, model->weights.mlp_gate_w[i], nullptr);
-            llaisysLinear(up, mlp_in_t, model->weights.mlp_up_w[i], nullptr);
-
-            // swiglu -> act [1, di]
-            auto act_tensor = Tensor::create(gate_shape, LLAISYS_DTYPE_F32, LLAISYS_DEVICE_CPU, 0);
-            LlaisysTensor *act = new LlaisysTensor{act_tensor};
+            llaisysLinear(gate, norm2, model->weights.mlp_gate_w[i], nullptr);
+            llaisysLinear(up, norm2, model->weights.mlp_up_w[i], nullptr);
             llaisysSwiGLU(act, gate, up);
-
-            // down projection -> out [1, hs]
-            auto down_tensor = Tensor::create(emb_shape, LLAISYS_DTYPE_F32, LLAISYS_DEVICE_CPU, 0);
-            LlaisysTensor *down = new LlaisysTensor{down_tensor};
             llaisysLinear(down, act, model->weights.mlp_down_w[i], nullptr);
 
-            // residual: x = x + down
-            auto new_x_tensor = Tensor::create(emb_shape, LLAISYS_DTYPE_F32, LLAISYS_DEVICE_CPU, 0);
-            LlaisysTensor *new_x = new LlaisysTensor{new_x_tensor};
-            llaisysAdd(new_x, x, down);
+            auto x_next = make_tensor(hidden_shape, dtype, model->device_type, model->device_id);
+            llaisysAdd(x_next, x, down);
+            delete x;
+            x = x_next;
 
-            // swap x
-            delete x; x = new_x;
-
-            // cleanup temporaries
-            delete mlp_in_t;
+            delete norm2;
             delete gate;
             delete up;
             delete act;
             delete down;
-            std::cerr << "[llaisys qwen2] layer " << i << " mlp done" << std::endl;
         }
-
-        if (norm) delete norm;
-        std::cerr << "[llaisys qwen2] layer " << i << " end" << std::endl;
     }
 
-    // logits
-    std::cerr << "[llaisys qwen2] before logits" << std::endl;
-    std::cerr << "[llaisys qwen2] x ptr=" << x << " out_embed ptr=" << model->weights.out_embed << std::endl;
-    std::vector<size_t> logits_shape = {1, model->meta.voc};
-    auto logits_tensor = Tensor::create(logits_shape, LLAISYS_DTYPE_F32, LLAISYS_DEVICE_CPU, 0);
-    LlaisysTensor *logits = new LlaisysTensor{logits_tensor};
-    std::cerr << "[llaisys qwen2] calling llaisysLinear for logits" << std::endl;
-    llaisysLinear(logits, x, model->weights.out_embed, nullptr);
-    std::cerr << "[llaisys qwen2] after llaisysLinear for logits" << std::endl;
+    llaisysTensor_t logits_in = x;
+    llaisysTensor_t out_norm = nullptr;
+    if (model->weights.out_norm_w) {
+        out_norm = make_tensor(hidden_shape, dtype, model->device_type, model->device_id);
+        llaisysRmsNorm(out_norm, x, model->weights.out_norm_w, model->meta.epsilon);
+        logits_in = out_norm;
+    }
 
-    // argmax
-    std::vector<size_t> one_shape = {1};
-    auto max_idx_t = Tensor::create(one_shape, LLAISYS_DTYPE_I64, LLAISYS_DEVICE_CPU, 0);
-    auto max_val_t = Tensor::create(one_shape, LLAISYS_DTYPE_F32, LLAISYS_DEVICE_CPU, 0);
-    LlaisysTensor *max_idx = new LlaisysTensor{max_idx_t};
-    LlaisysTensor *max_val = new LlaisysTensor{max_val_t};
-    std::cerr << "[llaisys qwen2] calling argmax" << std::endl;
+    auto logits = make_tensor({1, model->meta.voc}, dtype, model->device_type, model->device_id);
+    llaisysLinear(logits, logits_in, model->weights.out_embed, nullptr);
+
+    auto max_idx = make_tensor(one_shape, LLAISYS_DTYPE_I64, model->device_type, model->device_id);
+    auto max_val = make_tensor(one_shape, dtype, model->device_type, model->device_id);
     llaisysArgmax(max_idx, max_val, logits);
-    std::cerr << "[llaisys qwen2] after argmax" << std::endl;
 
-    int64_t *res_ptr = reinterpret_cast<int64_t *>(max_idx->tensor->data());
-    int64_t next = res_ptr ? res_ptr[0] : model->meta.end_token;
+    int64_t next = model->meta.end_token;
+    if (max_idx->tensor->deviceType() == LLAISYS_DEVICE_CPU) {
+        int64_t *res_ptr = reinterpret_cast<int64_t *>(max_idx->tensor->data());
+        next = res_ptr ? res_ptr[0] : model->meta.end_token;
+    } else {
+        runtime_api->memcpy_sync(&next, max_idx->tensor->data(), sizeof(int64_t), LLAISYS_MEMCPY_D2H);
+    }
 
-    // cleanup
     delete idx;
     delete x;
+    if (out_norm) delete out_norm;
     delete logits;
     delete max_idx;
     delete max_val;
 
+    return next;
+}
+
+__export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken) {
+    if (!model) return -1;
+    if (ntoken == 0 || token_ids == nullptr) return model->meta.end_token;
+
+    int64_t next = model->meta.end_token;
+    for (size_t i = 0; i < ntoken; ++i) {
+        next = infer_one_token(model, token_ids[i]);
+    }
     return next;
 }
 

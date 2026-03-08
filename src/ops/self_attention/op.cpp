@@ -2,6 +2,9 @@
 #include "../../core/llaisys_core.hpp"
 #include "../../utils.hpp"
 #include "cpu/self_attention_cpu.hpp"
+#ifdef ENABLE_NVIDIA_API
+#include "nvidia/self_attention_nvidia.hpp"
+#endif
 
 namespace llaisys::ops {
 void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float scale) {
@@ -24,6 +27,19 @@ void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float
                                    attn_val->dtype(), seqlen, total_len, nhead, nkvhead, d, dv, scale);
     }
 
-    EXCEPTION_UNSUPPORTED_DEVICE;
+    llaisys::core::context().setDevice(attn_val->deviceType(), attn_val->deviceId());
+
+    switch (attn_val->deviceType()) {
+    case LLAISYS_DEVICE_CPU:
+        return cpu::self_attention(attn_val->data(), q->data(), k->data(), v->data(),
+                                   attn_val->dtype(), seqlen, total_len, nhead, nkvhead, d, dv, scale);
+#ifdef ENABLE_NVIDIA_API
+    case LLAISYS_DEVICE_NVIDIA:
+        return nvidia::self_attention(attn_val->data(), q->data(), k->data(), v->data(),
+                                      attn_val->dtype(), seqlen, total_len, nhead, nkvhead, d, dv, scale);
+#endif
+    default:
+        EXCEPTION_UNSUPPORTED_DEVICE;
+    }
 }
 }
