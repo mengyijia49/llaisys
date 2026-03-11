@@ -1,6 +1,6 @@
 from .libllaisys import LIB_LLAISYS
 from .tensor import Tensor
-from ctypes import c_float, c_int
+from ctypes import c_float, c_int, c_uint64
 
 
 class Ops:
@@ -38,6 +38,24 @@ class Ops:
     def rope(out: Tensor, inp: Tensor, pos_ids: Tensor, theta: float):
         LIB_LLAISYS.llaisysROPE(
             out.lib_tensor(), inp.lib_tensor(), pos_ids.lib_tensor(), c_float(theta)
+        )
+
+    @staticmethod
+    def sample(
+        out_idx: Tensor,
+        logits: Tensor,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        seed: int = 0,
+    ):
+        LIB_LLAISYS.llaisysSample(
+            out_idx.lib_tensor(),
+            logits.lib_tensor(),
+            c_float(float(temperature)),
+            c_int(int(top_k)),
+            c_float(float(top_p)),
+            c_uint64(int(seed) & ((1 << 64) - 1)),
         )
 
     @staticmethod

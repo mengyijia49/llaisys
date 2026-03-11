@@ -1,10 +1,15 @@
 #include "llaisys/models/qwen2.h"
 #include "llaisys/tensor.h"
 #include "llaisys_tensor.hpp"
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
+#include <numeric>
+#include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <regex>
 #include <vector>
 #include <iostream>
@@ -299,37 +304,56 @@ struct KVCache {
     LlaisysQwen2Model *owner = nullptr;
     size_t max_tokens = 0;
     size_t nlayer = 0;
-    std::vector<std::vector<llaisysTensor_t>> keys;
-    std::vector<std::vector<llaisysTensor_t>> vals;
+    size_t nkvh = 0;
+    size_t dh = 0;
+    llaisysDataType_t dtype = LLAISYS_DTYPE_INVALID;
+    llaisysDeviceType_t device_type = LLAISYS_DEVICE_CPU;
+    int device_id = 0;
+    size_t len = 0;
+    std::vector<llaisysTensor_t> key_cache;
+    std::vector<llaisysTensor_t> val_cache;
+    std::vector<int64_t> token_history;
 };
 
 static llaisysTensor_t make_tensor(const std::vector<size_t> &shape, llaisysDataType_t dtype, llaisysDeviceType_t device, int device_id) {
     return new LlaisysTensor{llaisys::Tensor::create(shape, dtype, device, device_id)};
 }
 
-static void clear_layer_cache(std::vector<llaisysTensor_t> &cache) {
-    for (auto *t : cache) {
-        delete t;
-    }
+static void clear_layer_cache_tensor_array(std::vector<llaisysTensor_t> &cache) {
+    for (auto *t : cache) delete t;
     cache.clear();
 }
 
-static void kv_append_for_layer(KVCache *kv, size_t layer_idx, llaisysTensor_t k, llaisysTensor_t v) {
+static bool kv_append_for_layer(KVCache *kv, size_t layer_idx, llaisysTensor_t k, llaisysTensor_t v, const LlaisysRuntimeAPI *runtime_api) {
     if (!kv || layer_idx >= kv->nlayer || !k || !v) {
-        return;
+        return false;
     }
-    auto &ks = kv->keys[layer_idx];
-    auto &vs = kv->vals[layer_idx];
-
-    if (kv->max_tokens > 0 && ks.size() >= kv->max_tokens) {
-        delete ks.front();
-        ks.erase(ks.begin());
-        delete vs.front();
-        vs.erase(vs.begin());
+    if (kv->len >= kv->max_tokens) {
+        return false;
     }
 
-    ks.push_back(k);
-    vs.push_back(v);
+    ASSERT(
+        k->tensor->numel() == kv->nkvh * kv->dh && v->tensor->numel() == kv->nkvh * kv->dh,
+        "KV cache append expects [1, nkvh, dh] tensors.");
+
+    const size_t token_bytes = kv->nkvh * kv->dh * llaisys::utils::dsize(kv->dtype);
+    std::byte *kdst = kv->key_cache[layer_idx]->tensor->data() + kv->len * token_bytes;
+    std::byte *vdst = kv->val_cache[layer_idx]->tensor->data() + kv->len * token_bytes;
+    runtime_api->memcpy_sync(kdst, k->tensor->data(), token_bytes, LLAISYS_MEMCPY_D2D);
+    runtime_api->memcpy_sync(vdst, v->tensor->data(), token_bytes, LLAISYS_MEMCPY_D2D);
+    return true;
+}
+
+static llaisysTensor_t kv_layer_view(llaisysTensor_t cache, size_t len) {
+    return new LlaisysTensor{cache->tensor->slice(0, 0, len)};
+}
+
+static void kv_append_token_history(KVCache *kv, int64_t token_id) {
+    if (!kv) return;
+    if (kv->token_history.size() >= kv->max_tokens) {
+        kv->token_history.erase(kv->token_history.begin());
+    }
+    kv->token_history.push_back(token_id);
 }
 
 __export void *llaisysQwen2KVCreat(struct LlaisysQwen2Model * model, size_t max_tokens) {
@@ -341,13 +365,21 @@ __export void *llaisysQwen2KVCreat(struct LlaisysQwen2Model * model, size_t max_
 
     KVCache *kv = new KVCache();
     kv->owner = model;
-    kv->max_tokens = max_tokens;
+    kv->max_tokens = std::max<size_t>(max_tokens, 1);
     kv->nlayer = model->meta.nlayer;
-    kv->keys.resize(kv->nlayer);
-    kv->vals.resize(kv->nlayer);
+    kv->nkvh = model->meta.nkvh;
+    kv->dh = model->meta.dh;
+    kv->dtype = model->meta.dtype;
+    kv->device_type = model->device_type;
+    kv->device_id = model->device_id;
+    kv->len = 0;
+    kv->key_cache.resize(kv->nlayer, nullptr);
+    kv->val_cache.resize(kv->nlayer, nullptr);
+    kv->token_history.reserve(kv->max_tokens);
+
     for (size_t i = 0; i < kv->nlayer; ++i) {
-        kv->keys[i].reserve(max_tokens);
-        kv->vals[i].reserve(max_tokens);
+        kv->key_cache[i] = make_tensor({kv->max_tokens, kv->nkvh, kv->dh}, kv->dtype, kv->device_type, kv->device_id);
+        kv->val_cache[i] = make_tensor({kv->max_tokens, kv->nkvh, kv->dh}, kv->dtype, kv->device_type, kv->device_id);
     }
     model->kv_cache = kv;
     return (void *)kv;
@@ -356,12 +388,9 @@ __export void *llaisysQwen2KVCreat(struct LlaisysQwen2Model * model, size_t max_
 __export void llaisysQwen2KVDestroy(void *kv) {
     if (!kv) return;
     KVCache *c = (KVCache *)kv;
-    for (size_t i = 0; i < c->nlayer; ++i) {
-        clear_layer_cache(c->keys[i]);
-        clear_layer_cache(c->vals[i]);
-    }
-    c->keys.clear();
-    c->vals.clear();
+    clear_layer_cache_tensor_array(c->key_cache);
+    clear_layer_cache_tensor_array(c->val_cache);
+    c->token_history.clear();
     if (c->owner && c->owner->kv_cache == c) {
         c->owner->kv_cache = nullptr;
     }
@@ -372,15 +401,17 @@ __export int llaisysQwen2KVAppend(void *kv, llaisysTensor_t k, llaisysTensor_t v
     if (!kv) return -1;
     KVCache *c = (KVCache *)kv;
     if (c->nlayer == 0) return -1;
-    kv_append_for_layer(c, 0, k, v);
+    llaisys::core::context().setDevice(c->device_type, c->device_id);
+    const LlaisysRuntimeAPI *runtime_api = llaisys::core::context().runtime().api();
+    if (!kv_append_for_layer(c, 0, k, v, runtime_api)) return -1;
+    c->len += 1;
     return 0;
 }
 
 __export size_t llaisysQwen2KVLen(void *kv) {
     if (!kv) return 0;
     KVCache *c = (KVCache *)kv;
-    if (c->nlayer == 0) return 0;
-    return c->keys[0].size();
+    return c->len;
 }
 
 __export uint8_t llaisysQwen2ModelHasWeight(struct LlaisysQwen2Model * model, const char * name) {
@@ -390,7 +421,122 @@ __export uint8_t llaisysQwen2ModelHasWeight(struct LlaisysQwen2Model * model, co
     return it != model->weight_map.end() ? 1 : 0;
 }
 
-static int64_t infer_one_token(struct LlaisysQwen2Model *model, int64_t token_id) {
+struct SamplingParams {
+    bool enabled = false;
+    int top_k = 1;
+    float top_p = 1.0f;
+    float temperature = 1.0f;
+    uint64_t seed = 0;
+    float repetition_penalty = 1.0f;
+    int no_repeat_ngram_size = 0;
+};
+
+static std::vector<float> tensor_to_host_logits(llaisysTensor_t logits, const LlaisysRuntimeAPI *runtime_api) {
+    const size_t n = logits->tensor->numel();
+    std::vector<float> host(n, 0.0f);
+    if (n == 0) return host;
+
+    const llaisysDataType_t dtype = logits->tensor->dtype();
+    const size_t bytes = n * logits->tensor->elementSize();
+    std::vector<std::byte> raw(bytes);
+    if (logits->tensor->deviceType() == LLAISYS_DEVICE_CPU) {
+        std::memcpy(raw.data(), logits->tensor->data(), bytes);
+    } else {
+        runtime_api->memcpy_sync(raw.data(), logits->tensor->data(), bytes, LLAISYS_MEMCPY_D2H);
+    }
+
+    switch (dtype) {
+    case LLAISYS_DTYPE_F32: {
+        auto *p = reinterpret_cast<const float *>(raw.data());
+        for (size_t i = 0; i < n; ++i) host[i] = p[i];
+        break;
+    }
+    case LLAISYS_DTYPE_F16: {
+        auto *p = reinterpret_cast<const llaisys::fp16_t *>(raw.data());
+        for (size_t i = 0; i < n; ++i) host[i] = llaisys::utils::cast<float>(p[i]);
+        break;
+    }
+    case LLAISYS_DTYPE_BF16: {
+        auto *p = reinterpret_cast<const llaisys::bf16_t *>(raw.data());
+        for (size_t i = 0; i < n; ++i) host[i] = llaisys::utils::cast<float>(p[i]);
+        break;
+    }
+    default:
+        EXCEPTION_UNSUPPORTED_DATATYPE(dtype);
+    }
+    return host;
+}
+
+static void write_host_logits_to_tensor(llaisysTensor_t logits, const std::vector<float> &host) {
+    const llaisysDataType_t dtype = logits->tensor->dtype();
+    switch (dtype) {
+    case LLAISYS_DTYPE_F32: {
+        logits->tensor->load(host.data());
+        break;
+    }
+    case LLAISYS_DTYPE_F16: {
+        std::vector<llaisys::fp16_t> tmp(host.size());
+        for (size_t i = 0; i < host.size(); ++i) tmp[i] = llaisys::utils::cast<llaisys::fp16_t>(host[i]);
+        logits->tensor->load(tmp.data());
+        break;
+    }
+    case LLAISYS_DTYPE_BF16: {
+        std::vector<llaisys::bf16_t> tmp(host.size());
+        for (size_t i = 0; i < host.size(); ++i) tmp[i] = llaisys::utils::cast<llaisys::bf16_t>(host[i]);
+        logits->tensor->load(tmp.data());
+        break;
+    }
+    default:
+        EXCEPTION_UNSUPPORTED_DATATYPE(dtype);
+    }
+}
+
+static void apply_sampling_constraints(
+    std::vector<float> &logits,
+    const std::vector<int64_t> &token_history,
+    float repetition_penalty,
+    int no_repeat_ngram_size) {
+    if (token_history.empty()) return;
+    const int64_t vocab = static_cast<int64_t>(logits.size());
+
+    if (repetition_penalty > 1.0f) {
+        std::unordered_set<int64_t> seen;
+        seen.reserve(token_history.size());
+        for (int64_t t : token_history) {
+            if (t < 0 || t >= vocab) continue;
+            if (!seen.insert(t).second) continue;
+            float &logit = logits[static_cast<size_t>(t)];
+            if (logit > 0.0f) logit /= repetition_penalty;
+            else logit *= repetition_penalty;
+        }
+    }
+
+    if (no_repeat_ngram_size > 1 && token_history.size() >= static_cast<size_t>(no_repeat_ngram_size - 1)) {
+        const size_t n = static_cast<size_t>(no_repeat_ngram_size);
+        const size_t prefix_len = n - 1;
+        std::vector<int64_t> prefix(prefix_len);
+        for (size_t i = 0; i < prefix_len; ++i) {
+            prefix[i] = token_history[token_history.size() - prefix_len + i];
+        }
+
+        for (size_t i = 0; i + n <= token_history.size(); ++i) {
+            bool match = true;
+            for (size_t j = 0; j < prefix_len; ++j) {
+                if (token_history[i + j] != prefix[j]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (!match) continue;
+            const int64_t banned = token_history[i + prefix_len];
+            if (banned >= 0 && banned < vocab) {
+                logits[static_cast<size_t>(banned)] = -std::numeric_limits<float>::infinity();
+            }
+        }
+    }
+}
+
+static int64_t infer_one_token(struct LlaisysQwen2Model *model, int64_t token_id, const SamplingParams &sampling) {
     using namespace llaisys;
 
     if (!model->weights.in_embed || !model->weights.out_embed) {
@@ -418,6 +564,8 @@ static int64_t infer_one_token(struct LlaisysQwen2Model *model, int64_t token_id
     llaisysEmbedding(x, idx, model->weights.in_embed);
 
     KVCache *kv = model->kv_cache;
+    kv_append_token_history(kv, token_id);
+    bool kv_token_appended = false;
 
     for (size_t i = 0; i < model->meta.nlayer; ++i) {
         bool has_attn = model->weights.attn_norm_w && model->weights.attn_q_w && model->weights.attn_k_w && model->weights.attn_v_w &&
@@ -442,7 +590,7 @@ static int64_t infer_one_token(struct LlaisysQwen2Model *model, int64_t token_id
 
             int64_t pos = 0;
             if (kv && i < kv->nlayer) {
-                pos = static_cast<int64_t>(kv->keys[i].size());
+                pos = static_cast<int64_t>(kv->len);
             }
 
             auto pos_ids = make_tensor(one_shape, LLAISYS_DTYPE_I64, model->device_type, model->device_id);
@@ -453,33 +601,20 @@ static int64_t infer_one_token(struct LlaisysQwen2Model *model, int64_t token_id
             llaisysROPE(q_rope, q, pos_ids, model->meta.theta);
             llaisysROPE(k_rope, k, pos_ids, model->meta.theta);
 
-            bool saved_in_cache = false;
+            bool using_kv = false;
+            llaisysTensor_t k_all = nullptr;
+            llaisysTensor_t v_all = nullptr;
             if (kv && i < kv->nlayer) {
-                kv_append_for_layer(kv, i, k_rope, v);
-                saved_in_cache = true;
-            }
-
-            std::vector<llaisysTensor_t> local_keys;
-            std::vector<llaisysTensor_t> local_vals;
-            const std::vector<llaisysTensor_t> *k_src = nullptr;
-            const std::vector<llaisysTensor_t> *v_src = nullptr;
-            if (saved_in_cache) {
-                k_src = &kv->keys[i];
-                v_src = &kv->vals[i];
+                bool ok = kv_append_for_layer(kv, i, k_rope, v, runtime_api);
+                ASSERT(ok, "KV cache capacity exceeded while appending token.");
+                const size_t total_len = kv->len + 1;
+                k_all = kv_layer_view(kv->key_cache[i], total_len);
+                v_all = kv_layer_view(kv->val_cache[i], total_len);
+                using_kv = true;
+                kv_token_appended = true;
             } else {
-                local_keys.push_back(k_rope);
-                local_vals.push_back(v);
-                k_src = &local_keys;
-                v_src = &local_vals;
-            }
-
-            const size_t total_len = k_src->size();
-            auto k_all = make_tensor({total_len, nkvh, dh}, dtype, model->device_type, model->device_id);
-            auto v_all = make_tensor({total_len, nkvh, dh}, dtype, model->device_type, model->device_id);
-            const size_t bytes_per_token = nkvh * dh * k_all->tensor->elementSize();
-            for (size_t j = 0; j < total_len; ++j) {
-                runtime_api->memcpy_sync(k_all->tensor->data() + j * bytes_per_token, (*k_src)[j]->tensor->data(), bytes_per_token, LLAISYS_MEMCPY_D2D);
-                runtime_api->memcpy_sync(v_all->tensor->data() + j * bytes_per_token, (*v_src)[j]->tensor->data(), bytes_per_token, LLAISYS_MEMCPY_D2D);
+                k_all = k_rope;
+                v_all = v;
             }
 
             auto attn_val = make_tensor(q_shape, dtype, model->device_type, model->device_id);
@@ -503,13 +638,15 @@ static int64_t infer_one_token(struct LlaisysQwen2Model *model, int64_t token_id
             delete k;
             delete pos_ids;
             delete q_rope;
-            delete k_all;
-            delete v_all;
             delete attn_val;
             delete attn_flat;
             delete attn_out;
-
-            if (!saved_in_cache) {
+            if (using_kv) {
+                delete k_all;
+                delete v_all;
+                delete k_rope;
+                delete v;
+            } else {
                 delete k_rope;
                 delete v;
             }
@@ -546,6 +683,10 @@ static int64_t infer_one_token(struct LlaisysQwen2Model *model, int64_t token_id
         }
     }
 
+    if (kv && kv_token_appended) {
+        kv->len += 1;
+    }
+
     llaisysTensor_t logits_in = x;
     llaisysTensor_t out_norm = nullptr;
     if (model->weights.out_norm_w) {
@@ -557,24 +698,39 @@ static int64_t infer_one_token(struct LlaisysQwen2Model *model, int64_t token_id
     auto logits = make_tensor({1, model->meta.voc}, dtype, model->device_type, model->device_id);
     llaisysLinear(logits, logits_in, model->weights.out_embed, nullptr);
 
-    auto max_idx = make_tensor(one_shape, LLAISYS_DTYPE_I64, model->device_type, model->device_id);
-    auto max_val = make_tensor(one_shape, dtype, model->device_type, model->device_id);
-    llaisysArgmax(max_idx, max_val, logits);
+    auto sampled_idx = make_tensor(one_shape, LLAISYS_DTYPE_I64, model->device_type, model->device_id);
+    if (sampling.enabled) {
+        const bool use_penalty = sampling.repetition_penalty > 1.0f;
+        const bool use_no_repeat = sampling.no_repeat_ngram_size > 1;
+        if ((use_penalty || use_no_repeat) && kv && !kv->token_history.empty()) {
+            auto host_logits = tensor_to_host_logits(logits, runtime_api);
+            apply_sampling_constraints(
+                host_logits,
+                kv->token_history,
+                sampling.repetition_penalty,
+                sampling.no_repeat_ngram_size);
+            write_host_logits_to_tensor(logits, host_logits);
+        }
+        llaisysSample(sampled_idx, logits, sampling.temperature, sampling.top_k, sampling.top_p, sampling.seed);
+    } else {
+        auto max_val = make_tensor(one_shape, dtype, model->device_type, model->device_id);
+        llaisysArgmax(sampled_idx, max_val, logits);
+        delete max_val;
+    }
 
     int64_t next = model->meta.end_token;
-    if (max_idx->tensor->deviceType() == LLAISYS_DEVICE_CPU) {
-        int64_t *res_ptr = reinterpret_cast<int64_t *>(max_idx->tensor->data());
+    if (sampled_idx->tensor->deviceType() == LLAISYS_DEVICE_CPU) {
+        int64_t *res_ptr = reinterpret_cast<int64_t *>(sampled_idx->tensor->data());
         next = res_ptr ? res_ptr[0] : model->meta.end_token;
     } else {
-        runtime_api->memcpy_sync(&next, max_idx->tensor->data(), sizeof(int64_t), LLAISYS_MEMCPY_D2H);
+        runtime_api->memcpy_sync(&next, sampled_idx->tensor->data(), sizeof(int64_t), LLAISYS_MEMCPY_D2H);
     }
 
     delete idx;
     delete x;
     if (out_norm) delete out_norm;
     delete logits;
-    delete max_idx;
-    delete max_val;
+    delete sampled_idx;
 
     return next;
 }
@@ -583,9 +739,43 @@ __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_
     if (!model) return -1;
     if (ntoken == 0 || token_ids == nullptr) return model->meta.end_token;
 
+    const SamplingParams sampling{};
     int64_t next = model->meta.end_token;
     for (size_t i = 0; i < ntoken; ++i) {
-        next = infer_one_token(model, token_ids[i]);
+        next = infer_one_token(model, token_ids[i], sampling);
+    }
+    return next;
+}
+
+__export int64_t llaisysQwen2ModelInferSampled(
+    struct LlaisysQwen2Model * model,
+    int64_t * token_ids,
+    size_t ntoken,
+    int top_k,
+    float top_p,
+    float temperature,
+    uint64_t seed,
+    float repetition_penalty,
+    int no_repeat_ngram_size) {
+    if (!model) return -1;
+    if (ntoken == 0 || token_ids == nullptr) return model->meta.end_token;
+
+    SamplingParams sampling{};
+    sampling.enabled = true;
+    sampling.top_k = top_k;
+    sampling.top_p = top_p;
+    sampling.temperature = temperature;
+    sampling.seed = seed;
+    sampling.repetition_penalty = repetition_penalty;
+    sampling.no_repeat_ngram_size = no_repeat_ngram_size;
+
+    int64_t next = model->meta.end_token;
+    for (size_t i = 0; i < ntoken; ++i) {
+        SamplingParams step = sampling;
+        if (step.seed != 0) {
+            step.seed += static_cast<uint64_t>(i);
+        }
+        next = infer_one_token(model, token_ids[i], step);
     }
     return next;
 }

@@ -411,6 +411,54 @@ python test/test_infer.py --model [dir_path/to/model] --test --device nvidia
 
 实际应用中，用户可以开启多个对话并在它们之间切换，还能修改历史问题让 AI 重新生成回答。扩展 UI，支持这些功能。实现一个支持前缀匹配的 KV-Cache 池，尽可能复用已有结果。
 
+### 本仓库中的项目 #3 参考实现
+
+本仓库已包含项目 #3 的一套可运行实现：
+
+- 随机采样算子：`llaisysSample`（支持 `temperature`、`top_k`、`top_p`、`seed`）
+- 带采样的后端解码 API：`llaisysQwen2ModelInferSampled`
+- OpenAI 风格接口：`POST /v1/chat/completions`（支持可选 SSE 流式输出）
+- 命令行聊天客户端，带基础会话管理（`/new`、`/switch`、`/list`、`/clear`、`/regen`）
+
+编译并安装：
+
+```bash
+xmake
+xmake install
+pip install ./python/
+```
+
+启动聊天服务：
+
+```bash
+PYTHONPATH=python python -m llaisys.chat.server \
+  --model /path/to/DeepSeek-R1-Distill-Qwen-1.5B \
+  --engine llaisys \
+  --device cpu \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+启动命令行聊天客户端：
+
+```bash
+PYTHONPATH=python python -m llaisys.chat.cli \
+  --server http://127.0.0.1:8000 \
+  --stream \
+  --max_tokens 128 \
+  --top_k 50 \
+  --top_p 0.95 \
+  --temperature 0.7 \
+  --repetition_penalty 1.1 \
+  --no_repeat_ngram_size 3
+```
+
+采样算子测试：
+
+```bash
+PYTHONPATH=python python test/ops/sample.py --device cpu
+```
+
 ## 项目#4：多用户推理服务
 
 在做这个项目之前，你需要完成 ``项目#3`` 并实现流式输出。

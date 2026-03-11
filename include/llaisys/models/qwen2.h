@@ -47,6 +47,16 @@ __C {
     __export uint8_t llaisysQwen2ModelHasWeight(struct LlaisysQwen2Model * model, const char * name);
 
     __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken);
+    __export int64_t llaisysQwen2ModelInferSampled(
+        struct LlaisysQwen2Model * model,
+        int64_t * token_ids,
+        size_t ntoken,
+        int top_k,
+        float top_p,
+        float temperature,
+        uint64_t seed,
+        float repetition_penalty,
+        int no_repeat_ngram_size);
 
     // KV cache APIs
     __export void *llaisysQwen2KVCreat(struct LlaisysQwen2Model * model, size_t max_tokens);

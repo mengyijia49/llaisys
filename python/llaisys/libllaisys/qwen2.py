@@ -5,6 +5,7 @@ from ctypes import (
     c_size_t,
     c_float,
     c_int64,
+    c_uint64,
     c_void_p,
     c_char_p,
 )
@@ -53,6 +54,21 @@ def load_qwen2(lib):
         lib.llaisysQwen2ModelInfer.restype = c_int64
     else:
         print('[libllaisys.qwen2] Warning: llaisysQwen2ModelInfer not found in shared lib')
+
+    # int64_t llaisysQwen2ModelInferSampled(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken, int top_k, float top_p, float temperature, uint64_t seed, float repetition_penalty, int no_repeat_ngram_size);
+    if hasattr(lib, 'llaisysQwen2ModelInferSampled'):
+        lib.llaisysQwen2ModelInferSampled.argtypes = [
+            c_void_p,
+            POINTER(c_int64),
+            c_size_t,
+            c_int,
+            c_float,
+            c_float,
+            c_uint64,
+            c_float,
+            c_int,
+        ]
+        lib.llaisysQwen2ModelInferSampled.restype = c_int64
 
     # int llaisysQwen2ModelSetWeight(struct LlaisysQwen2Model * model, const char * name, llaisysTensor_t tensor);
     if hasattr(lib, 'llaisysQwen2ModelSetWeight'):

@@ -411,6 +411,54 @@ Build a UI that send requests to and receive responses from the chatbot server. 
 
 In real-world AI applications, users are allowed to start new conversations and switch between them. Users can also edit a past question and let the AI regenerate an answer. Enhance your UI to support these features. Implement a KV-Cache pool with prefix matching to reuse past results as much as possible.
 
+### Run the Project #3 implementation in this repo
+
+This repository includes a reference implementation for Project #3:
+
+- Random sampling operator: `llaisysSample` (`temperature`, `top_k`, `top_p`, `seed`)
+- Sampled decode backend API: `llaisysQwen2ModelInferSampled`
+- OpenAI-compatible chat endpoint: `POST /v1/chat/completions` with optional SSE streaming
+- CLI chat client with basic session management (`/new`, `/switch`, `/list`, `/clear`, `/regen`)
+
+Build and install:
+
+```bash
+xmake
+xmake install
+pip install ./python/
+```
+
+Start server:
+
+```bash
+PYTHONPATH=python python -m llaisys.chat.server \
+  --model /path/to/DeepSeek-R1-Distill-Qwen-1.5B \
+  --engine llaisys \
+  --device cpu \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+Run CLI client:
+
+```bash
+PYTHONPATH=python python -m llaisys.chat.cli \
+  --server http://127.0.0.1:8000 \
+  --stream \
+  --max_tokens 128 \
+  --top_k 50 \
+  --top_p 0.95 \
+  --temperature 0.7 \
+  --repetition_penalty 1.1 \
+  --no_repeat_ngram_size 3
+```
+
+Sampling operator test:
+
+```bash
+PYTHONPATH=python python test/ops/sample.py --device cpu
+```
+
 
 ## Project #4: Multi-user Inference Service
 
