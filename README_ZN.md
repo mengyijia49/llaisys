@@ -418,7 +418,10 @@ python test/test_infer.py --model [dir_path/to/model] --test --device nvidia
 - 随机采样算子：`llaisysSample`（支持 `temperature`、`top_k`、`top_p`、`seed`）
 - 带采样的后端解码 API：`llaisysQwen2ModelInferSampled`
 - OpenAI 风格接口：`POST /v1/chat/completions`（支持可选 SSE 流式输出）
-- 命令行聊天客户端，带基础会话管理（`/new`、`/switch`、`/list`、`/clear`、`/regen`）
+- 内置 Web UI：`GET /chat`，支持流式输出、本地多会话管理、历史编辑与重新生成
+- 命令行聊天客户端，支持多会话/历史管理（`/new`、`/switch`、`/list`、`/delete`、`/clear`、`/history`、`/regen`、`/edit`）
+- 长对话自动做上下文窗口裁剪，并在 CLI 中提示裁剪信息
+- Web UI/服务端会把浏览器会话 ID 传给后端，复用前缀 KV cache 来降低多轮对话的首字延迟；回答下方会显示命中的复用 token 数
 
 编译并安装：
 
@@ -437,6 +440,12 @@ PYTHONPATH=python python -m llaisys.chat.server \
   --device cpu \
   --host 127.0.0.1 \
   --port 8000
+```
+
+打开 Web UI：
+
+```text
+http://127.0.0.1:8000/chat
 ```
 
 启动命令行聊天客户端：

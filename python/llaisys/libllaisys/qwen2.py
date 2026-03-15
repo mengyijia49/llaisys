@@ -90,6 +90,14 @@ def load_qwen2(lib):
         lib.llaisysQwen2KVCreat.argtypes = [c_void_p, c_size_t]
         lib.llaisysQwen2KVCreat.restype = c_void_p
 
+    if hasattr(lib, 'llaisysQwen2KVCreatDetached'):
+        lib.llaisysQwen2KVCreatDetached.argtypes = [c_void_p, c_size_t]
+        lib.llaisysQwen2KVCreatDetached.restype = c_void_p
+
+    if hasattr(lib, 'llaisysQwen2KVClone'):
+        lib.llaisysQwen2KVClone.argtypes = [c_void_p, c_size_t]
+        lib.llaisysQwen2KVClone.restype = c_void_p
+
     if hasattr(lib, 'llaisysQwen2KVDestroy'):
         lib.llaisysQwen2KVDestroy.argtypes = [c_void_p]
         lib.llaisysQwen2KVDestroy.restype = None
@@ -101,6 +109,10 @@ def load_qwen2(lib):
     if hasattr(lib, 'llaisysQwen2KVLen'):
         lib.llaisysQwen2KVLen.argtypes = [c_void_p]
         lib.llaisysQwen2KVLen.restype = c_size_t
+
+    if hasattr(lib, 'llaisysQwen2ModelSetKV'):
+        lib.llaisysQwen2ModelSetKV.argtypes = [c_void_p, c_void_p]
+        lib.llaisysQwen2ModelSetKV.restype = c_int
 
 
 __all__ = ["LlaisysQwen2Meta", "load_qwen2"]

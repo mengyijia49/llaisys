@@ -418,7 +418,10 @@ This repository includes a reference implementation for Project #3:
 - Random sampling operator: `llaisysSample` (`temperature`, `top_k`, `top_p`, `seed`)
 - Sampled decode backend API: `llaisysQwen2ModelInferSampled`
 - OpenAI-compatible chat endpoint: `POST /v1/chat/completions` with optional SSE streaming
-- CLI chat client with basic session management (`/new`, `/switch`, `/list`, `/clear`, `/regen`)
+- Built-in Web UI at `GET /chat` with streaming, local multi-session management, and history editing/regeneration
+- CLI chat client with multi-session/history management (`/new`, `/switch`, `/list`, `/delete`, `/clear`, `/history`, `/regen`, `/edit`)
+- Automatic context-window trimming for long conversations, with optional warnings surfaced to the CLI
+- The Web UI forwards a browser session ID so the backend can reuse prefix KV cache across turns and reduce first-token latency; reused token counts are surfaced under responses
 
 Build and install:
 
@@ -437,6 +440,12 @@ PYTHONPATH=python python -m llaisys.chat.server \
   --device cpu \
   --host 127.0.0.1 \
   --port 8000
+```
+
+Open Web UI:
+
+```text
+http://127.0.0.1:8000/chat
 ```
 
 Run CLI client:

@@ -60,8 +60,11 @@ __C {
 
     // KV cache APIs
     __export void *llaisysQwen2KVCreat(struct LlaisysQwen2Model * model, size_t max_tokens);
+    __export void *llaisysQwen2KVCreatDetached(struct LlaisysQwen2Model * model, size_t max_tokens);
+    __export void *llaisysQwen2KVClone(void *kv, size_t max_tokens);
     __export void llaisysQwen2KVDestroy(void *kv);
     __export int llaisysQwen2KVAppend(void *kv, llaisysTensor_t k, llaisysTensor_t v);
     __export size_t llaisysQwen2KVLen(void *kv);
+    __export int llaisysQwen2ModelSetKV(struct LlaisysQwen2Model * model, void *kv);
 }
 #endif // LLAISYS_MODELS_QWEN2_H

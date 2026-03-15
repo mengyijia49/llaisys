@@ -1,4 +1,6 @@
-from typing import Iterator, Literal, Sequence
+from collections import OrderedDict
+from dataclasses import dataclass
+from typing import Dict, Iterator, Literal, Optional, Sequence, Tuple
 from ..libllaisys import LIB_LLAISYS, DeviceType, DataType
 from .. import Tensor
 from ..libllaisys.qwen2 import LlaisysQwen2Meta
@@ -17,6 +19,22 @@ try:
     HF_AVAILABLE = True
 except Exception:
     HF_AVAILABLE = False
+
+
+@dataclass
+class _PrefixCacheEntry:
+    cache_key: str
+    tokens: Tuple[int, ...]
+    kv: int
+    capacity: int
+
+
+@dataclass
+class _PendingPromptCache:
+    cache_key: str
+    prompt_tokens: Tuple[int, ...]
+    kv: int
+    capacity: int
 
 
 class Qwen2:
@@ -40,6 +58,13 @@ class Qwen2:
         self._maxseq = 2048
         self._end_token = -1
         self._dtype = DataType.F32
+        self._prefix_cache_limit = 24
+        self._prefix_cache_pool: "OrderedDict[Tuple[str, Tuple[int, ...]], _PrefixCacheEntry]" = OrderedDict()
+        self._pending_prompt_cache: Dict[str, _PendingPromptCache] = {}
+        self._last_cache_info: Dict[str, int | bool | str] = {
+            "cache_hit": False,
+            "reused_prefix_tokens": 0,
+        }
 
         try_backend = backend in ("auto", "llaisys")
         if try_backend:
@@ -104,7 +129,6 @@ class Qwen2:
                         self._weight_tensors.append(t)
 
                 LIB_LLAISYS.llaisysQwen2ModelFinalize(self._backend_model)
-                self._backend_kv = LIB_LLAISYS.llaisysQwen2KVCreat(self._backend_model, self._maxseq)
 
                 required_groups = [
                     [b"model.norm.weight", b"norm.weight"],
@@ -146,6 +170,171 @@ class Qwen2:
             self.model.to(self.device)
             self.model.eval()
 
+    def _destroy_kv(self, kv) -> None:
+        if kv is None:
+            return
+        try:
+            LIB_LLAISYS.llaisysQwen2KVDestroy(kv)
+        except Exception:
+            pass
+
+    def _destroy_pending_prompt(self, cache_key: str) -> None:
+        pending = self._pending_prompt_cache.pop(str(cache_key), None)
+        if pending is not None:
+            self._destroy_kv(pending.kv)
+
+    def _backend_create_detached_kv(self, max_tokens: int):
+        if not hasattr(LIB_LLAISYS, "llaisysQwen2KVCreatDetached"):
+            return None
+        return LIB_LLAISYS.llaisysQwen2KVCreatDetached(self._backend_model, max(1, int(max_tokens)))
+
+    def _backend_clone_kv(self, kv, max_tokens: int):
+        if kv is None or not hasattr(LIB_LLAISYS, "llaisysQwen2KVClone"):
+            return None
+        return LIB_LLAISYS.llaisysQwen2KVClone(kv, max(1, int(max_tokens)))
+
+    def _replace_active_kv(self, kv) -> None:
+        previous = self._backend_kv
+        if hasattr(LIB_LLAISYS, "llaisysQwen2ModelSetKV"):
+            rc = LIB_LLAISYS.llaisysQwen2ModelSetKV(self._backend_model, kv)
+            if rc != 0:
+                raise RuntimeError("failed to activate qwen2 KV cache")
+        else:
+            raise RuntimeError("llaisys shared library is missing llaisysQwen2ModelSetKV")
+        self._backend_kv = kv
+        if previous is not None and previous != kv:
+            self._destroy_kv(previous)
+
+    def _backend_prefill(self, token_ids: Sequence[int]) -> None:
+        ids = [int(t) for t in token_ids]
+        if not ids:
+            return
+        self._backend_infer(
+            ids,
+            top_k=1,
+            top_p=1.0,
+            temperature=1.0,
+            seed=0,
+            repetition_penalty=1.0,
+            no_repeat_ngram_size=0,
+            use_sampled_infer=False,
+        )
+
+    def _store_prefix_snapshot(self, cache_key: Optional[str], token_ids: Sequence[int], kv, capacity: int) -> None:
+        if kv is None:
+            return
+        if not cache_key:
+            self._destroy_kv(kv)
+            return
+        tokens = tuple(int(t) for t in token_ids)
+        if not tokens:
+            self._destroy_kv(kv)
+            return
+        namespaced = (str(cache_key), tokens)
+        existing = self._prefix_cache_pool.pop(namespaced, None)
+        if existing is not None:
+            self._destroy_kv(existing.kv)
+        self._prefix_cache_pool[namespaced] = _PrefixCacheEntry(
+            cache_key=str(cache_key),
+            tokens=tokens,
+            kv=kv,
+            capacity=max(1, int(capacity)),
+        )
+        self._prefix_cache_pool.move_to_end(namespaced)
+        while len(self._prefix_cache_pool) > self._prefix_cache_limit:
+            _, evicted = self._prefix_cache_pool.popitem(last=False)
+            self._destroy_kv(evicted.kv)
+
+    def _find_best_prefix_snapshot(self, cache_key: Optional[str], input_ids: Sequence[int]) -> Optional[_PrefixCacheEntry]:
+        if not cache_key:
+            return None
+        wanted = [int(t) for t in input_ids]
+        best = None
+        for entry in reversed(self._prefix_cache_pool.values()):
+            if entry.cache_key != str(cache_key):
+                continue
+            prefix_len = len(entry.tokens)
+            if prefix_len == 0 or prefix_len >= len(wanted):
+                continue
+            if wanted[:prefix_len] != list(entry.tokens):
+                continue
+            best = entry
+            break
+        return best
+
+    def _record_pending_prompt(self, cache_key: Optional[str], prompt_ids: Sequence[int], kv, capacity: int) -> None:
+        if kv is None:
+            return
+        if not cache_key:
+            self._destroy_kv(kv)
+            return
+        key = str(cache_key)
+        self._destroy_pending_prompt(key)
+        self._pending_prompt_cache[key] = _PendingPromptCache(
+            cache_key=key,
+            prompt_tokens=tuple(int(t) for t in prompt_ids),
+            kv=kv,
+            capacity=max(1, int(capacity)),
+        )
+
+    def get_last_cache_info(self) -> Dict[str, int | bool | str]:
+        return dict(self._last_cache_info)
+
+    def clear_prefix_cache(self, cache_key: Optional[str] = None) -> None:
+        wanted = None if cache_key is None else str(cache_key)
+        for key in list(self._prefix_cache_pool.keys()):
+            namespaced, _ = key
+            if wanted is not None and namespaced != wanted:
+                continue
+            entry = self._prefix_cache_pool.pop(key)
+            self._destroy_kv(entry.kv)
+        if wanted is None:
+            for pending in list(self._pending_prompt_cache.values()):
+                self._destroy_kv(pending.kv)
+            self._pending_prompt_cache.clear()
+            return
+        self._destroy_pending_prompt(wanted)
+
+    def commit_prefix_cache(
+        self,
+        cache_key: Optional[str],
+        prompt_ids: Sequence[int],
+        visible_completion_ids: Sequence[int],
+        extra_capacity: int = 128,
+    ) -> None:
+        if self._backend_model is None or not cache_key:
+            return
+        key = str(cache_key)
+        pending = self._pending_prompt_cache.pop(key, None)
+        if pending is None:
+            return
+
+        prompt_tokens = tuple(int(t) for t in prompt_ids)
+        if pending.prompt_tokens != prompt_tokens:
+            self._destroy_kv(pending.kv)
+            return
+
+        visible_ids = [int(t) for t in visible_completion_ids]
+        followup_prefix = list(prompt_tokens)
+        if visible_ids:
+            followup_prefix.extend(visible_ids[:-1])
+
+        if not followup_prefix:
+            self._destroy_kv(pending.kv)
+            return
+
+        target_capacity = max(int(pending.capacity), len(followup_prefix) + int(extra_capacity))
+        scratch = self._backend_clone_kv(pending.kv, target_capacity)
+        self._destroy_kv(pending.kv)
+        if scratch is None:
+            return
+
+        self._replace_active_kv(scratch)
+        if visible_ids[:-1]:
+            self._backend_prefill(visible_ids[:-1])
+        pool_snapshot = self._backend_clone_kv(self._backend_kv, target_capacity)
+        self._store_prefix_snapshot(key, followup_prefix, pool_snapshot, target_capacity)
+
     def generate(
         self,
         inputs: Sequence[int],
@@ -156,6 +345,7 @@ class Qwen2:
         seed: int = None,
         repetition_penalty: float = 1.1,
         no_repeat_ngram_size: int = 3,
+        cache_key: Optional[str] = None,
     ):
         input_ids = [int(t) for t in inputs]
         if not input_ids:
@@ -171,6 +361,7 @@ class Qwen2:
             seed=seed,
             repetition_penalty=repetition_penalty,
             no_repeat_ngram_size=no_repeat_ngram_size,
+            cache_key=cache_key,
         ):
             output_ids.append(token_id)
         return output_ids
@@ -216,6 +407,7 @@ class Qwen2:
         seed: int = None,
         repetition_penalty: float = 1.1,
         no_repeat_ngram_size: int = 3,
+        cache_key: Optional[str] = None,
     ) -> Iterator[int]:
         input_ids = [int(t) for t in inputs]
         if not input_ids:
@@ -234,17 +426,15 @@ class Qwen2:
         no_repeat_ngram_size = int(no_repeat_ngram_size)
 
         if self._backend_model is not None:
-            from ctypes import c_size_t
-
+            supports_prefix_cache = (
+                hasattr(LIB_LLAISYS, "llaisysQwen2KVCreatDetached")
+                and hasattr(LIB_LLAISYS, "llaisysQwen2KVClone")
+                and hasattr(LIB_LLAISYS, "llaisysQwen2ModelSetKV")
+            )
             kv_cap = len(input_ids) + max_new_tokens
             if self._maxseq > 0:
                 kv_cap = min(kv_cap, self._maxseq)
             kv_cap = max(kv_cap, 1)
-
-            if self._backend_kv is not None:
-                LIB_LLAISYS.llaisysQwen2KVDestroy(self._backend_kv)
-                self._backend_kv = None
-            self._backend_kv = LIB_LLAISYS.llaisysQwen2KVCreat(self._backend_model, c_size_t(kv_cap))
 
             use_sampled_infer = hasattr(LIB_LLAISYS, "llaisysQwen2ModelInferSampled")
             rng = random.Random(seed if seed is not None else None)
@@ -254,8 +444,72 @@ class Qwen2:
                     return 0
                 return rng.getrandbits(64)
 
+            if not supports_prefix_cache:
+                self._last_cache_info = {
+                    "cache_hit": False,
+                    "reused_prefix_tokens": 0,
+                    "cache_key": str(cache_key) if cache_key else "",
+                }
+                if self._backend_kv is not None:
+                    LIB_LLAISYS.llaisysQwen2KVDestroy(self._backend_kv)
+                    self._backend_kv = None
+                self._backend_kv = LIB_LLAISYS.llaisysQwen2KVCreat(self._backend_model, kv_cap)
+                next_token = self._backend_infer(
+                    input_ids,
+                    top_k=top_k,
+                    top_p=top_p,
+                    temperature=temperature,
+                    seed=next_seed(),
+                    repetition_penalty=repetition_penalty,
+                    no_repeat_ngram_size=no_repeat_ngram_size,
+                    use_sampled_infer=use_sampled_infer,
+                )
+                for _ in range(max_new_tokens):
+                    if next_token is None:
+                        break
+                    next_token = int(next_token)
+                    yield next_token
+                    if self._end_token >= 0 and next_token == self._end_token:
+                        break
+                    next_token = self._backend_infer(
+                        [next_token],
+                        top_k=top_k,
+                        top_p=top_p,
+                        temperature=temperature,
+                        seed=next_seed(),
+                        repetition_penalty=repetition_penalty,
+                        no_repeat_ngram_size=no_repeat_ngram_size,
+                        use_sampled_infer=use_sampled_infer,
+                    )
+                return
+
+            prefix_entry = self._find_best_prefix_snapshot(cache_key, input_ids)
+            prefix_len = len(prefix_entry.tokens) if prefix_entry is not None else 0
+            self._last_cache_info = {
+                "cache_hit": bool(prefix_len),
+                "reused_prefix_tokens": int(prefix_len),
+                "cache_key": str(cache_key) if cache_key else "",
+            }
+
+            active_kv = None
+            if prefix_entry is not None:
+                active_kv = self._backend_clone_kv(prefix_entry.kv, kv_cap)
+            if active_kv is None:
+                active_kv = self._backend_create_detached_kv(kv_cap)
+            if active_kv is None:
+                raise RuntimeError("failed to create qwen2 KV cache")
+
+            self._replace_active_kv(active_kv)
+
+            if len(input_ids) > 1 and prefix_len < len(input_ids) - 1:
+                self._backend_prefill(input_ids[prefix_len:-1])
+
+            if cache_key and len(input_ids) > 1:
+                prompt_prefix_snapshot = self._backend_clone_kv(self._backend_kv, kv_cap)
+                self._store_prefix_snapshot(cache_key, input_ids[:-1], prompt_prefix_snapshot, kv_cap)
+
             next_token = self._backend_infer(
-                input_ids,
+                [input_ids[-1]],
                 top_k=top_k,
                 top_p=top_p,
                 temperature=temperature,
@@ -264,6 +518,10 @@ class Qwen2:
                 no_repeat_ngram_size=no_repeat_ngram_size,
                 use_sampled_infer=use_sampled_infer,
             )
+
+            if cache_key:
+                full_prompt_snapshot = self._backend_clone_kv(self._backend_kv, kv_cap)
+                self._record_pending_prompt(cache_key, input_ids, full_prompt_snapshot, kv_cap)
 
             for _ in range(max_new_tokens):
                 if next_token is None:
@@ -308,6 +566,10 @@ class Qwen2:
 
     def __del__(self):
         try:
+            self.clear_prefix_cache()
+        except Exception:
+            pass
+        try:
             if self._backend_kv is not None:
                 LIB_LLAISYS.llaisysQwen2KVDestroy(self._backend_kv)
                 self._backend_kv = None
@@ -315,6 +577,7 @@ class Qwen2:
             pass
         try:
             if self._backend_model is not None:
+                self._backend_kv = None
                 LIB_LLAISYS.llaisysQwen2ModelDestroy(self._backend_model)
         except Exception:
             pass

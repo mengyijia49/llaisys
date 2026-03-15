@@ -301,7 +301,8 @@ __export int llaisysQwen2ModelFinalize(struct LlaisysQwen2Model * model) {
 
 // Simple KV cache structure and APIs
 struct KVCache {
-    LlaisysQwen2Model *owner = nullptr;
+    LlaisysQwen2Model *active_model = nullptr;
+    bool managed_by_model = false;
     size_t max_tokens = 0;
     size_t nlayer = 0;
     size_t nkvh = 0;
@@ -322,6 +323,18 @@ static llaisysTensor_t make_tensor(const std::vector<size_t> &shape, llaisysData
 static void clear_layer_cache_tensor_array(std::vector<llaisysTensor_t> &cache) {
     for (auto *t : cache) delete t;
     cache.clear();
+}
+
+static void detach_model_kv(LlaisysQwen2Model *model, bool destroy_if_managed) {
+    if (!model || !model->kv_cache) return;
+    KVCache *current = model->kv_cache;
+    model->kv_cache = nullptr;
+    if (current->active_model == model) {
+        current->active_model = nullptr;
+    }
+    if (destroy_if_managed && current->managed_by_model) {
+        llaisysQwen2KVDestroy((void *)current);
+    }
 }
 
 static bool kv_append_for_layer(KVCache *kv, size_t layer_idx, llaisysTensor_t k, llaisysTensor_t v, const LlaisysRuntimeAPI *runtime_api) {
@@ -358,13 +371,10 @@ static void kv_append_token_history(KVCache *kv, int64_t token_id) {
 
 __export void *llaisysQwen2KVCreat(struct LlaisysQwen2Model * model, size_t max_tokens) {
     if (!model) return nullptr;
-
-    if (model->kv_cache) {
-        llaisysQwen2KVDestroy((void *)model->kv_cache);
-    }
-
+    detach_model_kv(model, true);
     KVCache *kv = new KVCache();
-    kv->owner = model;
+    kv->active_model = model;
+    kv->managed_by_model = true;
     kv->max_tokens = std::max<size_t>(max_tokens, 1);
     kv->nlayer = model->meta.nlayer;
     kv->nkvh = model->meta.nkvh;
@@ -385,14 +395,74 @@ __export void *llaisysQwen2KVCreat(struct LlaisysQwen2Model * model, size_t max_
     return (void *)kv;
 }
 
+__export void *llaisysQwen2KVCreatDetached(struct LlaisysQwen2Model * model, size_t max_tokens) {
+    if (!model) return nullptr;
+    KVCache *kv = new KVCache();
+    kv->active_model = nullptr;
+    kv->managed_by_model = false;
+    kv->max_tokens = std::max<size_t>(max_tokens, 1);
+    kv->nlayer = model->meta.nlayer;
+    kv->nkvh = model->meta.nkvh;
+    kv->dh = model->meta.dh;
+    kv->dtype = model->meta.dtype;
+    kv->device_type = model->device_type;
+    kv->device_id = model->device_id;
+    kv->len = 0;
+    kv->key_cache.resize(kv->nlayer, nullptr);
+    kv->val_cache.resize(kv->nlayer, nullptr);
+    kv->token_history.reserve(kv->max_tokens);
+
+    for (size_t i = 0; i < kv->nlayer; ++i) {
+        kv->key_cache[i] = make_tensor({kv->max_tokens, kv->nkvh, kv->dh}, kv->dtype, kv->device_type, kv->device_id);
+        kv->val_cache[i] = make_tensor({kv->max_tokens, kv->nkvh, kv->dh}, kv->dtype, kv->device_type, kv->device_id);
+    }
+    return (void *)kv;
+}
+
+__export void *llaisysQwen2KVClone(void *kv, size_t max_tokens) {
+    if (!kv) return nullptr;
+    KVCache *src = (KVCache *)kv;
+    const size_t target_tokens = std::max<size_t>(std::max<size_t>(max_tokens, 1), std::max(src->len, src->token_history.size()));
+    KVCache *dst = new KVCache();
+    dst->active_model = nullptr;
+    dst->managed_by_model = false;
+    dst->max_tokens = target_tokens;
+    dst->nlayer = src->nlayer;
+    dst->nkvh = src->nkvh;
+    dst->dh = src->dh;
+    dst->dtype = src->dtype;
+    dst->device_type = src->device_type;
+    dst->device_id = src->device_id;
+    dst->len = src->len;
+    dst->key_cache.resize(dst->nlayer, nullptr);
+    dst->val_cache.resize(dst->nlayer, nullptr);
+    dst->token_history = src->token_history;
+    dst->token_history.reserve(dst->max_tokens);
+
+    llaisys::core::context().setDevice(dst->device_type, dst->device_id);
+    const LlaisysRuntimeAPI *runtime_api = llaisys::core::context().runtime().api();
+    const size_t token_bytes = dst->nkvh * dst->dh * llaisys::utils::dsize(dst->dtype);
+    const size_t used_bytes = dst->len * token_bytes;
+
+    for (size_t i = 0; i < dst->nlayer; ++i) {
+        dst->key_cache[i] = make_tensor({dst->max_tokens, dst->nkvh, dst->dh}, dst->dtype, dst->device_type, dst->device_id);
+        dst->val_cache[i] = make_tensor({dst->max_tokens, dst->nkvh, dst->dh}, dst->dtype, dst->device_type, dst->device_id);
+        if (used_bytes > 0) {
+            runtime_api->memcpy_sync(dst->key_cache[i]->tensor->data(), src->key_cache[i]->tensor->data(), used_bytes, LLAISYS_MEMCPY_D2D);
+            runtime_api->memcpy_sync(dst->val_cache[i]->tensor->data(), src->val_cache[i]->tensor->data(), used_bytes, LLAISYS_MEMCPY_D2D);
+        }
+    }
+    return (void *)dst;
+}
+
 __export void llaisysQwen2KVDestroy(void *kv) {
     if (!kv) return;
     KVCache *c = (KVCache *)kv;
     clear_layer_cache_tensor_array(c->key_cache);
     clear_layer_cache_tensor_array(c->val_cache);
     c->token_history.clear();
-    if (c->owner && c->owner->kv_cache == c) {
-        c->owner->kv_cache = nullptr;
+    if (c->active_model && c->active_model->kv_cache == c) {
+        c->active_model->kv_cache = nullptr;
     }
     delete c;
 }
@@ -412,6 +482,16 @@ __export size_t llaisysQwen2KVLen(void *kv) {
     if (!kv) return 0;
     KVCache *c = (KVCache *)kv;
     return c->len;
+}
+
+__export int llaisysQwen2ModelSetKV(struct LlaisysQwen2Model * model, void *kv) {
+    if (!model) return -1;
+    detach_model_kv(model, true);
+    if (!kv) return 0;
+    KVCache *c = (KVCache *)kv;
+    c->active_model = model;
+    model->kv_cache = c;
+    return 0;
 }
 
 __export uint8_t llaisysQwen2ModelHasWeight(struct LlaisysQwen2Model * model, const char * name) {

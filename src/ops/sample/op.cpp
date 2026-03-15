@@ -13,6 +13,22 @@
 
 namespace {
 
+double sortable_logit(float value) {
+    if (std::isfinite(value)) {
+        return static_cast<double>(value);
+    }
+    return -std::numeric_limits<double>::infinity();
+}
+
+bool logit_greater(const std::vector<float> &logits, size_t a, size_t b) {
+    const double lhs = sortable_logit(logits[a]);
+    const double rhs = sortable_logit(logits[b]);
+    if (lhs == rhs) {
+        return a < b;
+    }
+    return lhs > rhs;
+}
+
 float to_float(const std::byte *src, llaisysDataType_t dtype, size_t idx) {
     switch (dtype) {
     case LLAISYS_DTYPE_F32:
@@ -47,7 +63,16 @@ std::vector<float> copy_logits_to_host(llaisys::tensor_t logits) {
 }
 
 int64_t argmax_index(const std::vector<float> &logits) {
-    return static_cast<int64_t>(std::distance(logits.begin(), std::max_element(logits.begin(), logits.end())));
+    if (logits.empty()) {
+        return 0;
+    }
+    size_t best = 0;
+    for (size_t i = 1; i < logits.size(); ++i) {
+        if (logit_greater(logits, i, best)) {
+            best = i;
+        }
+    }
+    return static_cast<int64_t>(best);
 }
 
 int64_t sample_from_logits(const std::vector<float> &logits, float temperature, int top_k, float top_p, uint64_t seed) {
@@ -55,13 +80,16 @@ int64_t sample_from_logits(const std::vector<float> &logits, float temperature, 
     if (vocab == 0) {
         return 0;
     }
-    if (temperature <= 0.0f) {
+    if (temperature <= 1e-6f) {
         return argmax_index(logits);
     }
 
     int k = static_cast<int>(vocab);
     if (top_k > 0) {
         k = std::min<int>(top_k, static_cast<int>(vocab));
+    }
+    if (k <= 1) {
+        return argmax_index(logits);
     }
 
     float p = top_p;
@@ -71,9 +99,14 @@ int64_t sample_from_logits(const std::vector<float> &logits, float temperature, 
 
     std::vector<size_t> candidate_ids(vocab);
     std::iota(candidate_ids.begin(), candidate_ids.end(), size_t{0});
-    std::sort(candidate_ids.begin(), candidate_ids.end(), [&logits](size_t a, size_t b) { return logits[a] > logits[b]; });
+    std::stable_sort(candidate_ids.begin(), candidate_ids.end(), [&logits](size_t a, size_t b) {
+        return logit_greater(logits, a, b);
+    });
     if (static_cast<size_t>(k) < candidate_ids.size()) {
         candidate_ids.resize(static_cast<size_t>(k));
+    }
+    if (candidate_ids.empty()) {
+        return 0;
     }
 
     const float safe_temperature = std::max(temperature, 1e-6f);
@@ -81,7 +114,7 @@ int64_t sample_from_logits(const std::vector<float> &logits, float temperature, 
     std::vector<double> probs(candidate_ids.size(), 0.0);
     double max_scaled = -std::numeric_limits<double>::infinity();
     for (size_t i = 0; i < candidate_ids.size(); ++i) {
-        const double scaled = static_cast<double>(logits[candidate_ids[i]]) / static_cast<double>(safe_temperature);
+        const double scaled = sortable_logit(logits[candidate_ids[i]]) / static_cast<double>(safe_temperature);
         if (scaled > max_scaled) {
             max_scaled = scaled;
         }
@@ -116,6 +149,9 @@ int64_t sample_from_logits(const std::vector<float> &logits, float temperature, 
             probs.resize(keep);
             prob_sum = std::accumulate(probs.begin(), probs.end(), 0.0);
         }
+    }
+    if (candidate_ids.size() == 1) {
+        return static_cast<int64_t>(candidate_ids[0]);
     }
 
     if (prob_sum <= 0.0 || !std::isfinite(prob_sum)) {
@@ -172,4 +208,3 @@ void sample(tensor_t out_idx, tensor_t logits, float temperature, int top_k, flo
 }
 
 } // namespace llaisys::ops
-
