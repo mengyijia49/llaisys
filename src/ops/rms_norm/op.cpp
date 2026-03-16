@@ -2,7 +2,7 @@
 #include "../../core/llaisys_core.hpp"
 #include "../../utils.hpp"
 #include "cpu/rms_norm_cpu.hpp"
-#ifdef ENABLE_NVIDIA_API
+#if defined(ENABLE_NVIDIA_API) || defined(ENABLE_MUXI_API)
 #include "nvidia/rms_norm_nvidia.hpp"
 #endif
 
@@ -32,6 +32,10 @@ void rms_norm(tensor_t out, tensor_t in, tensor_t weight, float eps) {
         return cpu::rms_norm(out->data(), in->data(), weight->data(), out->dtype(), M, d, eps);
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
+        return nvidia::rms_norm(out->data(), in->data(), weight->data(), out->dtype(), M, d, eps);
+#endif
+#ifdef ENABLE_MUXI_API
+    case LLAISYS_DEVICE_MUXI:
         return nvidia::rms_norm(out->data(), in->data(), weight->data(), out->dtype(), M, d, eps);
 #endif
     default:

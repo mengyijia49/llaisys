@@ -159,7 +159,7 @@ def create_app(
 def main():
     parser = argparse.ArgumentParser(description="LLAISYS OpenAI-compatible chat server")
     parser.add_argument("--model", required=True, help="Path to model directory")
-    parser.add_argument("--device", default="cpu", choices=["cpu", "nvidia"])
+    parser.add_argument("--device", default="cpu", choices=["cpu", "nvidia", "muxi"])
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8000, type=int)
     parser.add_argument("--max-new-tokens", default=256, type=int)

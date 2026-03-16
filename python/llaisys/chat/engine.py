@@ -51,6 +51,8 @@ class ChatEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         if device.lower() == "nvidia":
             model_device = DeviceType.NVIDIA
+        elif device.lower() == "muxi":
+            model_device = DeviceType.MUXI
         else:
             model_device = DeviceType.CPU
         self.model = Qwen2(model_path, model_device)

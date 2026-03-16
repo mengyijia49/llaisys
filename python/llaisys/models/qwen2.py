@@ -18,7 +18,14 @@ class Qwen2:
         model_path = Path(model_path)
         self._backend_model = None
         self._backend_kv = None
-        self._device = DeviceType.CPU if device == DeviceType.CPU else DeviceType.NVIDIA
+        if device == DeviceType.CPU:
+            self._device = DeviceType.CPU
+        elif device == DeviceType.NVIDIA:
+            self._device = DeviceType.NVIDIA
+        elif device == DeviceType.MUXI:
+            self._device = DeviceType.MUXI
+        else:
+            raise ValueError(f"Unsupported device type: {device}")
         self._device_id = 0
         self._weight_tensors = []
         self._maxseq = 2048

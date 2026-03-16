@@ -2,7 +2,7 @@
 #include "../../core/llaisys_core.hpp"
 #include "../../utils.hpp"
 #include "cpu/rearrange_cpu.hpp"
-#ifdef ENABLE_NVIDIA_API
+#if defined(ENABLE_NVIDIA_API) || defined(ENABLE_MUXI_API)
 #include "nvidia/rearrange_nvidia.hpp"
 #endif
 
@@ -25,6 +25,10 @@ void rearrange(tensor_t out, tensor_t in) {
         return cpu::rearrange(out->data(), in->data(), out->dtype(), in->shape(), in->strides(), out->strides());
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
+        return nvidia::rearrange(out->data(), in->data(), out->dtype(), in->shape(), in->strides(), out->strides());
+#endif
+#ifdef ENABLE_MUXI_API
+    case LLAISYS_DEVICE_MUXI:
         return nvidia::rearrange(out->data(), in->data(), out->dtype(), in->shape(), in->strides(), out->strides());
 #endif
     default:

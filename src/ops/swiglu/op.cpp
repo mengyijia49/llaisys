@@ -2,7 +2,7 @@
 #include "../../core/llaisys_core.hpp"
 #include "../../utils.hpp"
 #include "cpu/swiglu_cpu.hpp"
-#ifdef ENABLE_NVIDIA_API
+#if defined(ENABLE_NVIDIA_API) || defined(ENABLE_MUXI_API)
 #include "nvidia/swiglu_nvidia.hpp"
 #endif
 
@@ -34,6 +34,10 @@ void swiglu(tensor_t out, tensor_t gate, tensor_t up) {
         return cpu::swiglu(out->data(), gate->data(), up->data(), out->dtype(), num_elements);
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
+        return nvidia::swiglu(out->data(), gate->data(), up->data(), out->dtype(), num_elements);
+#endif
+#ifdef ENABLE_MUXI_API
+    case LLAISYS_DEVICE_MUXI:
         return nvidia::swiglu(out->data(), gate->data(), up->data(), out->dtype(), num_elements);
 #endif
     default:

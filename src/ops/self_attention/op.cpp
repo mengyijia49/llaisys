@@ -2,7 +2,7 @@
 #include "../../core/llaisys_core.hpp"
 #include "../../utils.hpp"
 #include "cpu/self_attention_cpu.hpp"
-#ifdef ENABLE_NVIDIA_API
+#if defined(ENABLE_NVIDIA_API) || defined(ENABLE_MUXI_API)
 #include "nvidia/self_attention_nvidia.hpp"
 #endif
 
@@ -35,6 +35,11 @@ void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float
                                    attn_val->dtype(), seqlen, total_len, nhead, nkvhead, d, dv, scale);
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
+        return nvidia::self_attention(attn_val->data(), q->data(), k->data(), v->data(),
+                                      attn_val->dtype(), seqlen, total_len, nhead, nkvhead, d, dv, scale);
+#endif
+#ifdef ENABLE_MUXI_API
+    case LLAISYS_DEVICE_MUXI:
         return nvidia::self_attention(attn_val->data(), q->data(), k->data(), v->data(),
                                       attn_val->dtype(), seqlen, total_len, nhead, nkvhead, d, dv, scale);
 #endif

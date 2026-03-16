@@ -2,7 +2,7 @@
 #include "../../core/llaisys_core.hpp"
 #include "../../utils.hpp"
 #include "cpu/embedding_cpu.hpp"
-#ifdef ENABLE_NVIDIA_API
+#if defined(ENABLE_NVIDIA_API) || defined(ENABLE_MUXI_API)
 #include "nvidia/embedding_nvidia.hpp"
 #endif
 
@@ -35,6 +35,10 @@ void embedding(tensor_t out, tensor_t index, tensor_t weight) {
         return cpu::embedding(out->data(), index->data(), weight->data(), out->dtype(), num_indices, embedding_dim);
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
+        return nvidia::embedding(out->data(), index->data(), weight->data(), out->dtype(), num_indices, embedding_dim);
+#endif
+#ifdef ENABLE_MUXI_API
+    case LLAISYS_DEVICE_MUXI:
         return nvidia::embedding(out->data(), index->data(), weight->data(), out->dtype(), num_indices, embedding_dim);
 #endif
     default:

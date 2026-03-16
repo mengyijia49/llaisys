@@ -2,7 +2,7 @@
 #include "../../core/llaisys_core.hpp"
 #include "../../utils.hpp"
 #include "cpu/linear_cpu.hpp"
-#ifdef ENABLE_NVIDIA_API
+#if defined(ENABLE_NVIDIA_API) || defined(ENABLE_MUXI_API)
 #include "nvidia/linear_nvidia.hpp"
 #endif
 
@@ -38,6 +38,10 @@ void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) {
         return cpu::linear(out->data(), in->data(), weight->data(), bias_ptr, out->dtype(), M, N, K);
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
+        return nvidia::linear(out->data(), in->data(), weight->data(), bias_ptr, out->dtype(), M, N, K);
+#endif
+#ifdef ENABLE_MUXI_API
+    case LLAISYS_DEVICE_MUXI:
         return nvidia::linear(out->data(), in->data(), weight->data(), bias_ptr, out->dtype(), M, N, K);
 #endif
     default:

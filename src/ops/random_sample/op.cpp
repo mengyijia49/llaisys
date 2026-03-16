@@ -3,7 +3,7 @@
 #include "../../core/llaisys_core.hpp"
 #include "../../utils.hpp"
 #include "cpu/random_sample_cpu.hpp"
-#ifdef ENABLE_NVIDIA_API
+#if defined(ENABLE_NVIDIA_API) || defined(ENABLE_MUXI_API)
 #include "nvidia/random_sample_nvidia.hpp"
 #endif
 
@@ -38,8 +38,12 @@ void random_sample(
 
     llaisys::core::context().setDevice(logits->deviceType(), logits->deviceId());
 
-#ifdef ENABLE_NVIDIA_API
-    if (logits->deviceType() == LLAISYS_DEVICE_NVIDIA) {
+#if defined(ENABLE_NVIDIA_API) || defined(ENABLE_MUXI_API)
+    if (logits->deviceType() == LLAISYS_DEVICE_NVIDIA
+#ifdef ENABLE_MUXI_API
+        || logits->deviceType() == LLAISYS_DEVICE_MUXI
+#endif
+    ) {
         return nvidia::random_sample(
             out_idx->data(),
             logits->data(),

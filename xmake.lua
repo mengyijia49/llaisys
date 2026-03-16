@@ -13,9 +13,20 @@ option("nv-gpu")
     set_description("Whether to compile implementations for Nvidia GPU")
 option_end()
 
+option("mx-gpu")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Whether to compile implementations for Muxi GPU (CUDA-compatible bridge)")
+option_end()
+
 if has_config("nv-gpu") then
     add_defines("ENABLE_NVIDIA_API")
     includes("xmake/nvidia.lua")
+end
+
+if has_config("mx-gpu") then
+    add_defines("ENABLE_MUXI_API")
+    includes("xmake/muxi.lua")
 end
 
 target("llaisys-utils")
@@ -39,6 +50,9 @@ target("llaisys-device")
     add_deps("llaisys-device-cpu")
     if has_config("nv-gpu") then
         add_deps("llaisys-device-nvidia")
+    end
+    if has_config("mx-gpu") then
+        add_deps("llaisys-device-muxi")
     end
 
     set_languages("cxx17")
@@ -88,6 +102,9 @@ target("llaisys-ops")
     add_deps("llaisys-ops-cpu")
     if has_config("nv-gpu") then
         add_deps("llaisys-ops-nvidia")
+    end
+    if has_config("mx-gpu") then
+        add_deps("llaisys-ops-muxi")
     end
 
     set_languages("cxx17")
